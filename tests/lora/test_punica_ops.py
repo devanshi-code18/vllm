@@ -527,6 +527,41 @@ def test_kernels_hidden_size(
         )
 
 
+@pytest.mark.parametrize("batches", [1, 3, 16, 17, 32])
+@pytest.mark.parametrize("num_loras", [1, 4])
+@pytest.mark.parametrize("rank", [16, 64])
+@pytest.mark.parametrize("nslices", [1, 2, 3])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("seed", SEED)
+def test_lora_expand_decode(
+    batches: int,
+    num_loras: int,
+    rank: int,
+    nslices: int,
+    dtype: torch.dtype,
+    device: str,
+    seed: int,
+):
+    """Expand on decode batches (one token per sequence, `M <= 32`), which
+    use smaller M tiles; the tests above only run 128-token sequences."""
+    torch.set_default_device(device)
+    torch.accelerator.set_device_index(device)
+    set_random_seed(seed)
+
+    check_lora_expand_kernel(
+        batches=batches,
+        num_loras=num_loras,
+        rank=rank,
+        hidden_size=2049,
+        nslices=nslices,
+        dtype=dtype,
+        device=device,
+        seq_length=1,
+        add_inputs=True,
+    )
+
+
 @pytest.mark.parametrize("device", DEVICES)
 def test_add_lora_fused_moe_early_exit(device):
     """Ensures add_lora_fused_moe does not invoke the LoRA kernel or

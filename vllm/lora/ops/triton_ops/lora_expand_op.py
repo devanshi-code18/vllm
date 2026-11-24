@@ -13,6 +13,8 @@ from vllm.lora.ops.triton_ops.kernel_utils import do_expand_kernel
 from vllm.lora.ops.triton_ops.utils import (
     _get_lora_b_ptr,
     get_lora_op_configs,
+    is_batch_invariant,
+    load_lora_op_config,
     supports_pdl,
 )
 from vllm.platforms import current_platform
@@ -20,7 +22,8 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
-@triton.jit
+# Triton's `M == 1` specialization compiles a slower kernel; M only sizes the grid.
+@triton.jit(do_not_specialize=["M"])
 def _lora_expand_kernel(
     input_ptr,
     lora_ptr,
@@ -219,6 +222,15 @@ def _lora_expand(
         add_inputs=add_inputs,
     )
     BLOCK_M = kernel_config["block_m"]
+    # Decode batches leave most rows of the default 64-row tile empty. Size the
+    # tile to the batch unless tuned configs or batch invariance fix it.
+    if (
+        M <= 32
+        and current_platform.is_cuda()
+        and not is_batch_invariant
+        and load_lora_op_config("expand", add_inputs) is None
+    ):
+        BLOCK_M = 16 if M <= 16 else 32
     BLOCK_N = kernel_config["block_n"]
     BLOCK_K = kernel_config["block_k"]
     NUM_WARPS = kernel_config["num_warps"]
