@@ -11,6 +11,7 @@ import torch
 
 import vllm.models.inkling2.nvidia.ops.sconv as sconv_ops
 from tests.models.inkling2.test_attention import shear_rel_logits
+from vllm import envs
 from vllm.models.inkling2.nvidia.ops.attn_res import attn_res
 from vllm.models.inkling2.nvidia.ops.conv_mix import conv_mix
 from vllm.models.inkling2.nvidia.ops.norm import rms_norm
@@ -730,6 +731,51 @@ def test_sm12x_ll_gemm_projection_and_graph(tokens, shape, dtype):
         graph.replay()
         torch.testing.assert_close(out, expected, atol=0, rtol=0)
         check()
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(80),
+    reason="Inkling2 batch invariance is validated on A100",
+)
+@pytest.mark.parametrize(
+    "nb,n,k", [(0, 1024, 2304), (0, 32, 2304), (0, 201024, 2304), (3, 64, 4608)]
+)
+def test_ll_gemm_rows_match_batch_invariant_matmul(nb, n, k, monkeypatch):
+    """In batch-invariant mode the low-M kernels sum K in one pass: each row
+    has the bits the batch-invariant matmul gives it in a larger batch, and
+    batched weights take any M up to 256 in row blocks."""
+    import vllm.model_executor.determinism.batch_invariant as bi
+    from vllm.models.inkling2.nvidia.ops.ll_gemm_sm120 import (
+        qkv_bmm,
+        sm12x_bf16_ll_gemm,
+        use_sm12x_bf16_ll_gemm,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    torch.manual_seed(0)
+    if nb == 0:
+        x = torch.randn(300, k, device=DEVICE).bfloat16()
+        weight = (torch.randn(n, k, device=DEVICE) * k**-0.5).bfloat16()
+        reference = bi.matmul_persistent(x, weight.t(), out_dtype=torch.float32)
+        for m in (1, 7, 16):
+            assert use_sm12x_bf16_ll_gemm(x[:m], weight)
+            out = sm12x_bf16_ll_gemm(x[:m], weight, out_dtype=torch.float32)
+            assert torch.equal(out, reference[:m])
+        return
+    x = torch.randn(nb, 300, k, device=DEVICE).bfloat16()
+    weight = (torch.randn(nb, n, k, device=DEVICE) * k**-0.5).bfloat16()
+    reference = bi.bmm_batch_invariant(x, weight.transpose(1, 2))
+    for m in (1, 16, 40, 256):
+        rows = x[:, :m].contiguous()
+        assert use_sm12x_bf16_ll_gemm(rows, weight)
+        assert torch.equal(sm12x_bf16_ll_gemm(rows, weight), reference[:, :m])
+    w = (torch.randn(8600, 2304, device=DEVICE) * 2304**-0.5).bfloat16()
+    xs = [torch.randn(16, 2304, device=DEVICE).bfloat16() for _ in range(3)]
+    bounds = ((0, 6552), (6552, 7576), (7576, 8600))
+    expected = torch.cat(
+        [bi.matmul_persistent(x, w[a:b].t()) for x, (a, b) in zip(xs, bounds)], 1
+    )
+    assert torch.equal(qkv_bmm(*xs, w, 6552, 7576), expected)
 
 
 def test_sm12x_linear_large_batch_fallback():

@@ -19,6 +19,9 @@ from . import use_pdl
 from .pdl import gdc_launch_dependents, gdc_wait
 
 MAX_M = 16
+# Batch-invariant mode also serves batched (3-D) weights up to this many rows:
+# without split-K they match the batch-invariant bmm bit for bit, faster.
+_BI_BATCHED_MAX_M = 256
 _MP = 16
 _MAX_TILES = 4096
 
@@ -49,12 +52,17 @@ def _ll_gemm_kernel(
     """Program `(n, b, s)` computes column tile `n` of batch `b` over K range
     `s`. With `SPLIT > 1` it writes fp32 partials to `P` `[SPLIT, B, MP, N]`;
     the last of the tile's programs to finish (counted in `C`, reset to 0
-    after) sums them in split order, so results are deterministic."""
+    after) sums them in split order, so results are deterministic. With
+    `SPLIT == 1`, `s` picks the block of `MP` rows instead, for any M."""
     gdc_wait()
     pid_n = tl.program_id(0)
     b = tl.program_id(1)
-    s = tl.program_id(2)
-    rows = tl.arange(0, MP)
+    if SPLIT > 1:
+        s = tl.program_id(2)
+        rows = tl.arange(0, MP)
+    else:
+        s = 0
+        rows = tl.program_id(2) * MP + tl.arange(0, MP)
     cols = pid_n * BN + tl.arange(0, BN)
     ks = s * K_PER_SPLIT + tl.arange(0, BK)
     x_ptrs = X + (b * SXB + rows[:, None] * SXM + ks[None, :])
@@ -177,7 +185,7 @@ class _Config(NamedTuple):
 
 
 @functools.cache
-def _config(nb: int, n: int, k: int) -> _Config:
+def _config(nb: int, n: int, k: int, split_k: bool = True) -> _Config:
     """Split K into about one wave of programs when that gives at least 3
     splits, preferring 16-column tiles; otherwise one 32-column tile over all
     of K."""
@@ -186,7 +194,7 @@ def _config(nb: int, n: int, k: int) -> _Config:
     k_tiles = triton.cdiv(k, bk)
     for bn in (16, 32):
         split = min(32, k_tiles, num_sms // (nb * triton.cdiv(n, bn)))
-        if split >= 3:
+        if split >= 3 and split_k:
             tiles_per_split = triton.cdiv(k_tiles, split)
             split = triton.cdiv(k_tiles, tiles_per_split)
             return _Config(bn, bk, split, tiles_per_split * bk, 4, 4)
@@ -198,16 +206,10 @@ def _config(nb: int, n: int, k: int) -> _Config:
 
 
 @functools.cache
-def _supported_device() -> bool:
+def _supported() -> bool:
     """SM120/SM121, and SM80 (measured on A100; SM86/SM89 are untested)."""
     sm120 = current_platform.is_device_capability_family(120)
     return sm120 or current_platform.is_device_capability(80)
-
-
-def _supported() -> bool:
-    # Off in batch-invariant mode: these kernels serve M <= 16 only, so a row
-    # would change kernels with the batch size.
-    return not envs.VLLM_BATCH_INVARIANT and _supported_device()
 
 
 @functools.cache
@@ -221,12 +223,14 @@ def _ll_gemm(
 ) -> None:
     nb, m, k = x.shape
     n = w.shape[1]
-    assert 0 < m <= MAX_M and w.shape == (nb, n, k)
+    # Batch-invariant mode sums K in one pass, like the batch-invariant
+    # matmul, so a row gets the same bits from either kernel.
+    cfg = _config(nb, n, k, split_k=not envs.VLLM_BATCH_INVARIANT)
+    assert m > 0 and (m <= MAX_M or cfg.split == 1) and w.shape == (nb, n, k)
     assert x.stride(2) == w.stride(2) == 1
     assert bias is None or (bias.shape == (n,) and bias.stride(0) == 1)
     assert out.shape == (nb, m, n) and out.stride(2) == 1
     assert max(nb * w.stride(0), nb * x.stride(0), nb * out.stride(0)) < 2**31
-    cfg = _config(nb, n, k)
     n_tiles = triton.cdiv(n, cfg.bn)
     partials = counter = None
     if cfg.split > 1:
@@ -235,7 +239,7 @@ def _ll_gemm(
             (cfg.split, nb, _MP, n), dtype=torch.float32, device=x.device
         )
         counter = _counter(current_stream().cuda_stream)
-    _ll_gemm_kernel[(n_tiles, nb, cfg.split)](
+    _ll_gemm_kernel[(n_tiles, nb, cfg.split if cfg.split > 1 else triton.cdiv(m, _MP))](
         x,
         w,
         bias,
@@ -357,12 +361,15 @@ def use_sm12x_bf16_ll_gemm(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> bool:
     """Whether `sm12x_bf16_ll_gemm` serves these operands."""
+    max_m = MAX_M
     if weight.ndim == 2:
         shapes_ok = x.ndim >= 2
         m = x.numel() // max(x.shape[-1], 1)
     else:
         shapes_ok = weight.ndim == 3 and x.ndim == 3 and x.shape[0] == weight.shape[0]
         m = x.shape[-2] if x.ndim >= 2 else 0
+        if envs.VLLM_BATCH_INVARIANT:
+            max_m = _BI_BATCHED_MAX_M
     return (
         shapes_ok
         and x.is_cuda
@@ -370,7 +377,7 @@ def use_sm12x_bf16_ll_gemm(
         and x.dtype == weight.dtype == torch.bfloat16
         and x.shape[-1] == weight.shape[-1]
         and x.stride(-1) == weight.stride(-1) == 1
-        and 0 < m <= MAX_M
+        and 0 < m <= max_m
         and (
             bias is None
             or (
