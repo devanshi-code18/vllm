@@ -12,6 +12,7 @@ returned as is (fp32) without a norm weight.
 
 import torch
 
+from vllm import envs
 from vllm.models.inkling2.nvidia.ops.norm import rsqrt
 from vllm.triton_utils import tl, tldevice, triton
 
@@ -298,7 +299,9 @@ def attn_res(
     )
     # The queries of a token run back to back and share its sources in L2.
     grid = (num_q, num_tokens)
-    if num_tokens * num_q <= 256:
+    # The row kernel reduces over D in another order: batch-invariant mode
+    # keeps every batch size on the chunked kernel.
+    if num_tokens * num_q <= 256 and not envs.VLLM_BATCH_INVARIANT:
         block_a = triton.next_power_of_2(d + 1) // 2
         block_b = max(triton.next_power_of_2(d - block_a), 16)
         _attn_res_row_kernel[grid](

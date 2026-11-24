@@ -281,6 +281,25 @@ def matmul_descriptor_persistent(
     return c
 
 
+_TRITON_MATMUL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def _native_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """`a @ b` for dtypes the Triton kernels don't take (fp64, e.g. load-time
+    weight folding, never on a batch-dependent path), through `baddbmm`,
+    which batch-invariant mode leaves to the native kernel."""
+    out = torch.baddbmm(
+        a.new_empty(1, a.shape[0], b.shape[-1]), a[None], b[None], beta=0
+    )
+    out = out[0] if bias is None else out[0] + bias
+    return out if out_dtype is None else out.to(out_dtype)
+
+
 def matmul_persistent(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -293,6 +312,8 @@ def matmul_persistent(
     assert bias is None or bias.dim() == 1, (
         "Currently assuming bias is 1D, let Horace know if you run into this"
     )
+    if a.dtype not in _TRITON_MATMUL_DTYPES:
+        return _native_mm(a, b, bias, out_dtype)
     NUM_SMS = num_compute_units(a.device.index)
     M, K = a.shape
     K, N = b.shape
@@ -781,8 +802,8 @@ def mm_batch_invariant(a, b, bias=None):
     return matmul_persistent(a, b, bias=bias)
 
 
-def mm_dtype_batch_invariant(a, b, out_dtype, *, out=None):
-    # Same dtype checks as ATen's CUDA mm.dtype / mm.dtype_out.
+def _check_out_dtype(a, b, out_dtype, out):
+    # Same dtype checks as ATen's CUDA mm.dtype / bmm.dtype (and their outs).
     if a.dtype != b.dtype:
         raise RuntimeError("input dtypes must be the same")
     if out_dtype != a.dtype and not (
@@ -795,12 +816,26 @@ def mm_dtype_batch_invariant(a, b, out_dtype, *, out=None):
         raise RuntimeError(
             "out_dtype must be the same as the dtype of the provided out tensor"
         )
+
+
+def mm_dtype_batch_invariant(a, b, out_dtype, *, out=None):
+    _check_out_dtype(a, b, out_dtype, out)
     result = matmul_persistent(a, b, out_dtype=out_dtype)
     return result if out is None else out.copy_(result)
 
 
 def matmul_batch_invariant(a, b, *, out=None):
     # torch.matmul can handle various dimensions
+    if a.ndim == 1 or b.ndim == 1:
+        # A 1D operand is a row (a) or column (b) that the result drops.
+        result = matmul_batch_invariant(
+            a[None] if a.ndim == 1 else a, b[:, None] if b.ndim == 1 else b
+        )
+        if a.ndim == 1:
+            result = result.squeeze(-2)
+        if b.ndim == 1:
+            result = result.squeeze(-1)
+        return result if out is None else out.copy_(result)
     # For 2D x 2D, it's the same as mm
     if a.ndim == 2 and b.ndim == 2:
         result = mm_batch_invariant(a, b)
@@ -849,7 +884,7 @@ def matmul_batch_invariant(a, b, *, out=None):
         )
 
 
-def bmm_batch_invariant(a, b, *, out=None):
+def bmm_batch_invariant(a, b, *, out=None, out_dtype=None):
     # Batched matrix multiply: (B, M, K) x (B, K, N) -> (B, M, N)
     if not (a.ndim == 3 and b.ndim == 3):
         raise ValueError(
@@ -872,12 +907,16 @@ def bmm_batch_invariant(a, b, *, out=None):
     B, M, K = a.shape
     _, _, N = b.shape
     dtype = a.dtype
+    out_dtype = out_dtype or dtype
+    if dtype not in _TRITON_MATMUL_DTYPES:
+        native = torch.baddbmm(a.new_empty(B, M, N), a, b, beta=0)
+        return native if out is None else out.copy_(native)
 
     if out is None:
-        c = torch.empty((B, M, N), device=a.device, dtype=dtype)
+        c = torch.empty((B, M, N), device=a.device, dtype=out_dtype)
     else:
         assert out.shape == (B, M, N), "out tensor has incorrect shape"
-        assert out.dtype == dtype and out.device == a.device, "out tensor mismatch"
+        assert out.dtype == out_dtype and out.device == a.device, "out tensor mismatch"
         c = out
 
     if not _BLOCK_SIZES_RESOLVED:
@@ -979,6 +1018,11 @@ def mm_out_batch_invariant(a, b, *, out):
 
 def addmm_out_batch_invariant(bias, a, b, *, beta=1, alpha=1, out):
     return _addmm_impl(bias, a, b, beta, alpha, out)
+
+
+def bmm_dtype_batch_invariant(a, b, out_dtype, *, out=None):
+    _check_out_dtype(a, b, out_dtype, out)
+    return bmm_batch_invariant(a, b, out=out, out_dtype=out_dtype)
 
 
 def bmm_out_batch_invariant(a, b, *, out):
@@ -1462,6 +1506,12 @@ def enable_batch_invariant_mode():
         )
         _batch_invariant_LIB.impl(
             "aten::bmm.out", bmm_out_batch_invariant, key, allow_override=True
+        )
+        _batch_invariant_LIB.impl(
+            "aten::bmm.dtype", bmm_dtype_batch_invariant, key, allow_override=True
+        )
+        _batch_invariant_LIB.impl(
+            "aten::bmm.dtype_out", bmm_dtype_batch_invariant, key, allow_override=True
         )
 
     reduced_precision_val = (

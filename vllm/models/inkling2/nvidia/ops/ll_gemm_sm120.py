@@ -9,6 +9,7 @@ from typing import NamedTuple
 
 import torch
 
+from vllm import envs
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import num_compute_units
@@ -197,10 +198,16 @@ def _config(nb: int, n: int, k: int) -> _Config:
 
 
 @functools.cache
-def _supported() -> bool:
+def _supported_device() -> bool:
     """SM120/SM121, and SM80 (measured on A100; SM86/SM89 are untested)."""
     sm120 = current_platform.is_device_capability_family(120)
     return sm120 or current_platform.is_device_capability(80)
+
+
+def _supported() -> bool:
+    # Off in batch-invariant mode: these kernels serve M <= 16 only, so a row
+    # would change kernels with the batch size.
+    return not envs.VLLM_BATCH_INVARIANT and _supported_device()
 
 
 @functools.cache
