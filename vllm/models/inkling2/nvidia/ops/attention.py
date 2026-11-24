@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
@@ -397,6 +398,9 @@ def plan_decode_attention(
     """
     if max_query_len > _VERIFY_BLOCK_M // (num_heads // num_kv_heads):
         return 0
+    if envs.VLLM_BATCH_INVARIANT:
+        # One split: every request reads its keys in one order, as in prefill.
+        return 1
     work = num_reqs * num_kv_heads
     num_sms = num_compute_units()
     if is_local:

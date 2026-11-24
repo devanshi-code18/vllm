@@ -18,8 +18,11 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.inkling.nvidia.sconv_swa_attn import (
     InklingConvState,
+    InklingSconvBackend,
     InklingSconvMetadata,
 )
+from vllm.platforms import current_platform
+from vllm.v1.attention.backend import AttentionBackend
 
 from .ops.allreduce import Inkling2AllReduceWorkspace, all_reduce_conv_mix
 from .ops.conv_mix import conv_mix as fused_conv_mix
@@ -29,6 +32,23 @@ from .ops.sconv import short_conv
 from .ops.seq_parallel import SeqParallel
 
 K_STREAM, V_STREAM, ATTN_STREAM, MLP_STREAM = range(4)
+
+
+class Inkling2SconvBackend(InklingSconvBackend):
+    """The conv-state cache's metadata; it runs no kernel."""
+
+    @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        # Inkling2 is batch invariant where validated (A100); other GPUs run
+        # other attention, MoE and GEMM kernels.
+        return current_platform.is_device_capability(80)
+
+
+class Inkling2ConvState(InklingConvState):
+    """`InklingConvState` with Inkling2's batch-invariance support."""
+
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        return Inkling2SconvBackend
 
 
 def conv_metadata(owner: InklingConvState) -> InklingSconvMetadata | None:

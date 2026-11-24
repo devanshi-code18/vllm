@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 import torch
 
-from vllm import LLM, SamplingParams
+from vllm import LLM, SamplingParams, envs
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.models.inkling2.configs import (
     Inkling2DSparkConfig,
@@ -170,6 +170,64 @@ def test_tiny_looped_model_shared_cache(tmp_path):
     cleanup_dist_env_and_memory()
     separate = _prompt_logprobs(_tiny_looped_llm(tmp_path, {}), prompt)
     torch.testing.assert_close(shared, separate, atol=1e-3, rtol=0)
+
+
+def _redraw_loop_controllers(model: torch.nn.Module) -> None:
+    """Unit-scale loop message controllers (dummy ones leave every pass
+    alike)."""
+    from vllm.models.inkling2.nvidia.loop import Inkling2LoopDecoderLayer
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    for module in model.modules():
+        if isinstance(module, Inkling2LoopDecoderLayer):
+            down, gain_forget = module.controller_down, module.controller_gain_forget
+            down.normal_(std=down.shape[-1] ** -0.5, generator=generator)
+            gain_forget.normal_(std=gain_forget.shape[-1] ** -0.5, generator=generator)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(80),
+    reason="Inkling2 batch invariance is validated on A100",
+)
+def test_tiny_looped_model_batch_invariant(tmp_path, monkeypatch, enable_pickle):
+    """With VLLM_BATCH_INVARIANT=1 a request gets the same tokens and logprob
+    bits alone and next to other requests, through decode-only steps and
+    steps shared with prefill chunks of thousands of tokens (the attention,
+    q/r prologue, AttnRes and GEMM kernels otherwise pick their split or
+    tiling from the batch)."""
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    (tmp_path / "config.json").write_text(json.dumps(TINY_LOOP_CONFIG))
+    llm = LLM(
+        model=str(tmp_path),
+        load_format="dummy",
+        skip_tokenizer_init=True,
+        tokenizer_mode="hf",
+        gpu_memory_utilization=0.10,
+        max_num_batched_tokens=4096,
+        max_model_len=2048,
+        max_num_seqs=16,
+        enable_prefix_caching=False,
+        limit_mm_per_prompt={"image": 0},
+    )
+    llm.apply_model(_redraw_loop_controllers)
+    targets = [[7, 8, 9], list(range(2, 202)), [5] * 40, list(range(300, 900))]
+    fillers = [[2 + (7 * j + i) % 990 for j in range(1500)] for i in range(4)]
+    params = SamplingParams(
+        max_tokens=24, temperature=0, logprobs=0, ignore_eos=True, detokenize=False
+    )
+
+    def steps(output) -> tuple[list[int], list[float]]:
+        out = output.outputs[0]
+        assert out.logprobs is not None
+        return list(out.token_ids), [
+            lp[token].logprob for token, lp in zip(out.token_ids, out.logprobs)
+        ]
+
+    alone = [steps(llm.generate([{"prompt_token_ids": p}], params)[0]) for p in targets]
+    batched = llm.generate([{"prompt_token_ids": p} for p in targets + fillers], params)
+    for i, target in enumerate(alone):
+        assert steps(batched[i]) == target, f"target {i} changed with the batch"
 
 
 def test_loop_serving_options_validation(tmp_path):

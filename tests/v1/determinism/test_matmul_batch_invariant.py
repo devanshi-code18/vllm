@@ -212,6 +212,70 @@ def test_mm_out_dtype_batch_invariance():
 
 
 @skip_unsupported
+@pytest.mark.skipif(current_platform.is_xpu(), reason="bmm is not overridden on XPU")
+@pytest.mark.usefixtures("batch_invariant_mode")
+def test_bmm_out_dtype_batch_invariance():
+    """`torch.bmm(..., out_dtype=torch.float32)` (e.g. Inkling 2's loop
+    blend) takes the batch-invariant bmm, not cuBLAS."""
+    torch.manual_seed(42)
+    a = torch.randn((4, 40, 4608), dtype=torch.bfloat16, device=DEVICE_TYPE)
+    w = torch.randn((4, 4608, 64), dtype=torch.bfloat16, device=DEVICE_TYPE) * 0.02
+    batch_output = torch.bmm(a, w, out_dtype=torch.float32)
+    assert batch_output.dtype == torch.float32
+    for rows in (1, 3, 17):
+        torch.testing.assert_close(
+            torch.bmm(a[:, :rows], w, out_dtype=torch.float32),
+            batch_output[:, :rows],
+            rtol=0,
+            atol=0,
+        )
+    assert torch.equal(
+        batch_output, bi.bmm_batch_invariant(a, w, out_dtype=torch.float32)
+    )
+    out = torch.empty_like(batch_output)
+    assert torch.equal(torch.bmm(a, w, out_dtype=torch.float32, out=out), out)
+    assert torch.equal(out, batch_output)
+    with pytest.raises(RuntimeError, match="same as input dtype or fp32"):
+        torch.bmm(a, w, out_dtype=torch.float16)
+
+
+@skip_unsupported
+@requires_matmul_overrides
+@pytest.mark.usefixtures("batch_invariant_mode")
+@pytest.mark.parametrize(
+    "a_shape,b_shape",
+    [((40, 64), (64,)), ((64,), (64, 9)), ((64,), (64,)), ((3, 5, 64), (64,))],
+)
+def test_matmul_vector_operands(a_shape, b_shape):
+    """`torch.matmul` with a 1D operand (e.g. a bias folded into a head) keeps
+    torch's result shape and stays row-invariant."""
+    torch.manual_seed(0)
+    a = torch.randn(a_shape, dtype=torch.bfloat16, device=DEVICE_TYPE)
+    b = torch.randn(b_shape, dtype=torch.bfloat16, device=DEVICE_TYPE)
+    result = torch.matmul(a, b)
+    reference = torch.matmul(a.double().cpu(), b.double().cpu())
+    assert result.shape == reference.shape
+    torch.testing.assert_close(result.double().cpu(), reference, rtol=2e-2, atol=2e-1)
+    if a.ndim == 2:
+        assert torch.equal(torch.matmul(a[:1], b), result[:1])
+
+
+@skip_unsupported
+@requires_matmul_overrides
+@pytest.mark.usefixtures("batch_invariant_mode")
+def test_float64_matmul_uses_native_kernels():
+    """fp64 matmuls (load-time weight folding) have no Triton config: they
+    run natively instead of failing."""
+    torch.manual_seed(0)
+    a = torch.randn((300, 2304), dtype=torch.float64, device=DEVICE_TYPE)
+    b = torch.randn((2304, 256), dtype=torch.float64, device=DEVICE_TYPE)
+    torch.testing.assert_close((a @ b).cpu(), a.cpu() @ b.cpu())
+    torch.testing.assert_close(
+        torch.bmm(a[None], b[None]).cpu(), (a.cpu() @ b.cpu())[None]
+    )
+
+
+@skip_unsupported
 @requires_matmul_overrides
 @pytest.mark.usefixtures("batch_invariant_mode")
 def test_mm_out_dtype_keeps_aten_dtype_checks():

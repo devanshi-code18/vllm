@@ -24,6 +24,7 @@ RMS-normalizes V per head and writes both to the paged KV cache.
 
 import torch
 
+from vllm import envs
 from vllm.models.inkling2.nvidia.ops.norm import qr_clip_rel_tokens, rsqrt
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -831,14 +832,20 @@ def _kv_conv_tile(
 _PROLOGUE_SPLIT_MIN_TOKENS = 2048
 
 
+def _prologue_split(num_tokens: int) -> bool:
+    # Batch-invariant mode keeps every batch on the fused launch: the two
+    # launches compute q/r with different tilings (and so different bits).
+    return num_tokens >= _PROLOGUE_SPLIT_MIN_TOKENS and not envs.VLLM_BATCH_INVARIANT
+
+
 def _prologue_block_t(num_tokens: int) -> int:
-    return 8 if num_tokens >= _PROLOGUE_SPLIT_MIN_TOKENS else 4
+    return 8 if _prologue_split(num_tokens) else 4
 
 
 def _prologue_qr_tokens(num_tokens: int) -> int:
     """Tokens per program of the separate q/r launch, or 0 to run q/r in the
     K/V conv launch."""
-    return 8 if num_tokens >= _PROLOGUE_SPLIT_MIN_TOKENS else 0
+    return 8 if _prologue_split(num_tokens) else 0
 
 
 def attention_prologue(
