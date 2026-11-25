@@ -224,6 +224,15 @@ def _lora_expand(
         add_inputs=add_inputs,
     )
     BLOCK_M = kernel_config["block_m"]
+    # Decode batches leave most rows of the 64-row tile empty, which the fp32
+    # path below pays for three times. A row's bits don't depend on BLOCK_M on
+    # SM8x (same mma instruction and K order), so batch invariance holds.
+    if (
+        is_batch_invariant
+        and M <= 32
+        and current_platform.is_device_capability_family(80)
+    ):
+        BLOCK_M = 16 if M <= 16 else 32
     BLOCK_N = kernel_config["block_n"]
     BLOCK_K = kernel_config["block_k"]
     NUM_WARPS = kernel_config["num_warps"]
