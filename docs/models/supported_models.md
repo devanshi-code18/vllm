@@ -589,7 +589,7 @@ These models primarily accept the [`LLM.generate`](./generative_models.md#llmgen
 | `Idefics3ForConditionalGeneration` | Idefics3 | T + I | `HuggingFaceM4/Idefics3-8B-Llama3`, etc. | ✅︎ | |
 | `IsaacForConditionalGeneration` | Isaac | T + I<sup>+</sup> | `PerceptronAI/Isaac-0.1` | ✅︎ | ✅︎ |
 | `Inkling2ForConditionalGeneration` | Inkling 2 Small | T + I<sup>+</sup> | `thinkingmachines/Inkling-2-Small`, `thinkingmachines/Inkling-2-Small-MXFP8` | ✅︎ | |
-| `Inkling2LoopForConditionalGeneration` | Inkling 2 Mini | T + I<sup>+</sup> | `thinkingmachines/Inkling-2-Mini` | | |
+| `Inkling2LoopForConditionalGeneration` | Inkling 2 Mini | T + I<sup>+</sup> | `thinkingmachines/Inkling-2-Mini`, `thinkingmachines/TML-d24-varloop-research` | | |
 | `InternS1ForConditionalGeneration` | Intern-S1 | T + I<sup>E+</sup> + V<sup>E+</sup> | `internlm/Intern-S1`, `internlm/Intern-S1-mini`, etc. | ✅︎ | ✅︎ |
 | `InternS1ProForConditionalGeneration` | Intern-S1-Pro | T + I<sup>E+</sup> + V<sup>E+</sup> | `internlm/Intern-S1-Pro`, etc. | ✅︎ | ✅︎ |
 | `InternS2MobiusForConditionalGeneration` | Intern-S2-Mobius | T + I<sup>E+</sup> + V<sup>E+</sup> | `internlm/Intern-S2-Mobius` | ✅︎ | ✅︎ |
@@ -724,6 +724,23 @@ Some models are supported only via the [Transformers modeling backend](#transfor
     decoded into frames and audio, so they require both towers. The checkpoint also
     ships one MTP layer, enabled with
     `--speculative-config '{"method":"mtp","num_speculative_tokens":1}'`.
+
+!!! note "Inkling 2 loop passes"
+    Looped Inkling 2 checkpoints run their middle layers several times per token.
+    Variable-loop checkpoints (`loop_config.is_varloop`, e.g.
+    `thinkingmachines/TML-d24-varloop-research`, trained with 1 to 5 passes) take:
+
+    - `--hf-overrides '{"text_config": {"loop_num_passes": N}}'`: the pass count of
+      every request (default: the checkpoint's `num_passes`).
+    - `--hf-overrides '{"text_config": {"loop_max_passes": M}}'`: each request picks
+      its own count from 1 to `M` with `SamplingParams(extra_args={"loops": n})`
+      (`"vllm_xargs": {"loops": n}` in OpenAI-compatible requests); requests without
+      it use the default. A batch costs about as much as its largest count, the KV
+      cache holds `M` passes for every request, and CUDA graphs are captured for
+      each count. Not supported with DSpark drafts or `loop_share_cache`.
+
+    The chat template's `reasoning_effort` is a prompt setting and does not change
+    the pass count.
 
 !!! note
     `Gemma3nForConditionalGeneration` is only supported on V1 due to shared KV caching and it depends on `timm>=1.0.17` to make use of its

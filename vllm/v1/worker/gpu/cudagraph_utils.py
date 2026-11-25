@@ -664,6 +664,32 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.aux_hidden_states: list[torch.Tensor] = []
         self.use_aux_hidden_state_outputs = False
         self.intermediate_tensors: IntermediateTensors | None = None
+        # Graphs per ModelState.cudagraph_variant; one entry for most models.
+        self._variant_graphs: dict[
+            Hashable, dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph]
+        ] = {None: self.graphs}
+        self._variant_state: ModelState | None = None
+
+    def bind_model_state(self, model_state: ModelState) -> None:
+        """Key graphs by the state's `cudagraph_variant` if it has several."""
+        if model_state.cudagraph_variants() != (None,):
+            self._variant_state = model_state
+
+    def _variant_key(self, *args: Any, **kwargs: Any) -> Hashable:
+        assert self._variant_state is not None
+        return self._variant_state.cudagraph_variant
+
+    def init_breakable_cg_runner(
+        self, model: nn.Module, key_fn: Callable[..., Hashable] | None = None
+    ) -> None:
+        if key_fn is None and self._variant_state is not None:
+            key_fn = self._variant_key
+        super().init_breakable_cg_runner(model, key_fn)
+
+    def release_graphs(self) -> None:
+        for graphs in self._variant_graphs.values():
+            graphs.clear()
+        super().release_graphs()
 
     def capture(
         self,
@@ -681,6 +707,17 @@ class ModelCudaGraphManager(CudaGraphManager):
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
+        self.bind_model_state(model_state)
+        variants = model_state.cudagraph_variants()
+        if (
+            variants != (None,)
+            and self.cudagraph_mode.has_piecewise_cudagraphs()
+            and not self.use_breakable_cg
+        ):
+            raise RuntimeError(
+                f"{type(model).__name__}: per-variant piecewise CUDA graphs need "
+                "breakable CUDA graphs (VLLM_USE_BREAKABLE_CUDAGRAPH=1)."
+            )
         if self.use_breakable_cg:
             self.init_breakable_cg_runner(model)
 
@@ -868,12 +905,20 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             return forward_fn
 
-        super().capture(create_forward_fn, progress_bar_desc)
+        if variants == (None,):
+            super().capture(create_forward_fn, progress_bar_desc)
+            return
+        for variant in variants:
+            model_state.cudagraph_variant = variant
+            self.graphs = self._variant_graphs.setdefault(variant, {})
+            super().capture(create_forward_fn, f"{progress_bar_desc} [{variant}]")
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
         """Replay a captured FULL cudagraph and return hidden states."""
+        if self._variant_state is not None:
+            self.graphs = self._variant_graphs[self._variant_state.cudagraph_variant]
         super().run_fullgraph(desc)
         if not self.is_last_pp_rank:
             assert self.intermediate_tensors is not None
@@ -1067,6 +1112,7 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             if not runner.needs_cudagraph_capture():
                 return 0
             manager.pool = throwaway_pool
+            manager.bind_model_state(runner.model_state)
             if manager.use_breakable_cg:
                 # Create the breakable runner before the wrapper pool swap so
                 # its pool is covered as well.
@@ -1095,7 +1141,9 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             # extrapolated total. FULL and PIECEWISE share one pool here just as
             # they share the global pool at runtime, so the overlap is not
             # double-counted.
-            num_full_graphs = len(manager._capture_descs.get(CUDAGraphMode.FULL, []))
+            num_full_graphs = len(
+                manager._capture_descs.get(CUDAGraphMode.FULL, [])
+            ) * len(runner.model_state.cudagraph_variants())
             full_estimate = _extrapolate_full_graph_memory(mem_samples, num_full_graphs)
             return max(measured - sum(mem_samples) + full_estimate, 0)
         finally:

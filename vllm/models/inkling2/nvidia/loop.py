@@ -10,14 +10,27 @@ conv-state caches. In passes after the first, every core sublayer input
 AttnRes read of the previous pass's blocks, merged by a gated low-rank
 controller. Each sublayer's short conv runs fused with the next AttnRes mix
 (and small batches at TP > 1 with its all-reduce); without sequence parallel.
+
+With `loop_max_passes`, each request picks its pass count
+(`SamplingParams.extra_args["loops"]`). A batch runs its largest count, and
+every row enters the coda from the state of its own last pass; the batch's
+largest count selects the CUDA graphs (one set per count).
 """
 
-from collections.abc import Sequence
+from collections.abc import Hashable, Sequence
+from typing import Any
 
+import numpy as np
 import torch
 from torch import nn
 
 from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.sequence import IntermediateTensors
+from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.worker.gpu.buffer_utils import UvaBufferPool
+from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.states import RequestState
 
 from ..configs import Inkling2ModelConfig
 from ..quant_config import Inkling2QuantConfig
@@ -319,14 +332,28 @@ class Inkling2LoopModel(Inkling2Model):
         return num_blocks, outputs
 
     def forward(
-        self, positions: torch.Tensor, inputs_embeds: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        loop_passes: torch.Tensor | None = None,
+        num_loop_passes: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Prelude, `num_passes` core passes, then the coda. Each sublayer's
         short conv runs fused with the next AttnRes mix (and small batches
-        with its all-reduce)."""
+        with its all-reduce).
+
+        With per-request pass counts, `loop_passes` holds each token's count
+        and `num_loop_passes` their maximum: every row runs the maximum, and
+        its last pass's blocks and coda inputs are kept for the coda."""
         num_tokens, hidden = inputs_embeds.shape
         core = self.loop_core
-        num_passes = self.config.num_loop_passes
+        num_passes = (
+            self.config.default_loop_passes
+            if num_loop_passes is None
+            else num_loop_passes
+        )
+        per_row = loop_passes is not None and num_passes > 1
+        kept: tuple[torch.Tensor, torch.Tensor] | None = None
         stack = inputs_embeds.new_empty(
             (self._max_loop_blocks() + 1, num_tokens, hidden)
         )
@@ -378,6 +405,10 @@ class Inkling2LoopModel(Inkling2Model):
                 next_query, next_norm = self.attn_res.output_query, self.norm
             else:
                 next_i, next_pass = visits[visit + 1]
+                if per_row and i == core.stop - 1:
+                    # Each pass ends with the coda's inputs, as if it were
+                    # the last (a restart discards them).
+                    next_i, next_pass = core.stop, 0
                 next_query = self.attn_res.attn_queries[next_i - 1]
                 # Messages blend into fp32 mixes; a pass restart discards it.
                 next_norm = None if next_pass else self.layers[next_i].attn_norm
@@ -394,6 +425,23 @@ class Inkling2LoopModel(Inkling2Model):
                 tau,
                 plan,
             )
+            if per_row and i == core.stop - 1:
+                assert loop_passes is not None and prelude_blocks is not None
+                # The pass's blocks (the next pass's message bank) and the
+                # coda's inputs, kept for rows with at least `pass_idx + 1`
+                # passes.
+                blocks = stack[prelude_blocks + 1 : num_blocks + 1]
+                if kept is None:
+                    kept = blocks.clone(), inputs.clone()
+                else:
+                    keep = (loop_passes > pass_idx).view(1, -1, 1)
+                    kept = (
+                        torch.where(keep, blocks, kept[0]),
+                        torch.where(keep, inputs, kept[1]),
+                    )
+                if pass_idx + 1 == num_passes:
+                    blocks.copy_(kept[0])
+                    inputs = kept[1]
         assert inputs is not None
         out = inputs[0]
         if self.aux_hidden_state_layers:
@@ -401,6 +449,106 @@ class Inkling2LoopModel(Inkling2Model):
         return out
 
 
+class Inkling2LoopModelState(DefaultModelState):
+    """Per-request pass counts (`loop_max_passes`): each token's count for
+    the forward, and the batch's largest as its CUDA graph variant."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.text_config = self.model_config.hf_text_config
+        self.max_passes: int | None = self.text_config.loop_max_passes
+        self.req_passes: dict[str, int] = {}
+        if self.max_passes is None:
+            return
+        self.cudagraph_variant = self.max_passes
+        self.loop_passes = torch.ones(
+            self.max_num_tokens, dtype=torch.int32, device=self.device
+        )
+        self.loop_passes_staging = UvaBufferPool(self.max_num_tokens, torch.int32)
+
+    def cudagraph_variants(self) -> tuple[Hashable, ...]:
+        if self.max_passes is None:
+            return (None,)
+        return tuple(range(1, self.max_passes + 1))
+
+    def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+        super().add_request(req_index, new_req_data)
+        if self.max_passes is not None:
+            params = new_req_data.sampling_params
+            self.req_passes[new_req_data.req_id] = self.text_config.request_loop_passes(
+                params and params.extra_args
+            )
+
+    def remove_request(self, req_id: str) -> None:
+        super().remove_request(req_id)
+        self.req_passes.pop(req_id, None)
+
+    def prepare_inputs(
+        self, input_batch: InputBatch, req_states: RequestState
+    ) -> dict[str, Any]:
+        inputs = super().prepare_inputs(input_batch, req_states)
+        if self.max_passes is None:
+            return inputs
+        num_reqs = input_batch.num_reqs
+        # Dummy batches (profiling, warmup) run every pass.
+        passes = np.array(
+            [
+                self.req_passes.get(req_id, self.max_passes)
+                for req_id in input_batch.req_ids[:num_reqs]
+            ],
+            dtype=np.int32,
+        )
+        num_tokens = input_batch.num_tokens
+        padded = input_batch.num_tokens_after_padding
+        per_token = np.ones(padded, dtype=np.int32)
+        query_lens = np.diff(input_batch.query_start_loc_np[: num_reqs + 1])
+        per_token[:num_tokens] = np.repeat(passes, query_lens)[:num_tokens]
+        loop_passes = self.loop_passes_staging.copy_to_gpu(
+            per_token, out=self.loop_passes[:padded]
+        )
+        self.cudagraph_variant = int(passes.max()) if num_reqs else self.max_passes
+        return inputs | {
+            "loop_passes": loop_passes,
+            "num_loop_passes": self.cudagraph_variant,
+        }
+
+    def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+        inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+        if self.max_passes is None:
+            return inputs
+        # CUDA graph capture: every row runs the variant's passes.
+        passes = self.cudagraph_variant
+        assert isinstance(passes, int)
+        self.loop_passes[:num_tokens].fill_(passes)
+        return inputs | {
+            "loop_passes": self.loop_passes[:num_tokens],
+            "num_loop_passes": passes,
+        }
+
+
 class Inkling2LoopForConditionalGeneration(Inkling2ForConditionalGeneration):
     """The `inkling2_loop` checkpoints' architecture name; the model is
     `Inkling2ForConditionalGeneration` with an `Inkling2LoopModel`."""
+
+    @staticmethod
+    def get_model_state_cls() -> type[Inkling2LoopModelState]:
+        return Inkling2LoopModelState
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        """`loop_passes` and `num_loop_passes` (per-request pass counts) come
+        from `Inkling2LoopModelState.prepare_inputs`."""
+        if inputs_embeds is None:
+            assert input_ids is not None
+            inputs_embeds = self.model.embed_input_ids(input_ids)
+        loop_passes = kwargs.get("loop_passes")
+        num_loop_passes = kwargs.get("num_loop_passes")
+        assert loop_passes is None or isinstance(loop_passes, torch.Tensor)
+        assert num_loop_passes is None or isinstance(num_loop_passes, int)
+        return self.model(positions, inputs_embeds, loop_passes, num_loop_passes)
