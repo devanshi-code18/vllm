@@ -6,6 +6,35 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
+def _dot_a(
+    tiled_a,
+    tiled_b,
+    accumulator,
+    CAST_TYPE: tl.constexpr,
+    FP32_A: tl.constexpr,
+    b_dtype: tl.constexpr,
+):
+    """Accumulator + tiled_a @ tiled_b.
+
+    With FP32_A, the float32 A tile is split exactly into three b_dtype terms
+    (hi + mid + lo). Each term's products with the b_dtype B tile are exact in
+    float32, so this is a float32 product of the unrounded A, using three
+    tensor-core dots instead of one.
+    """
+    if FP32_A:
+        a_hi = tiled_a.to(b_dtype)
+        rest = tiled_a - a_hi.to(tl.float32)
+        a_mid = rest.to(b_dtype)
+        a_lo = (rest - a_mid.to(tl.float32)).to(b_dtype)
+        accumulator = tl.dot(a_lo, tiled_b, accumulator)
+        accumulator = tl.dot(a_mid, tiled_b, accumulator)
+        return tl.dot(a_hi, tiled_b, accumulator)
+    if CAST_TYPE:
+        tiled_a = tiled_a.to(b_dtype)
+    return tl.dot(tiled_a, tiled_b, accumulator)
+
+
+@triton.jit
 def mm_k(
     a_ptr: tl.tensor,
     b_ptr: tl.tensor,
@@ -22,6 +51,7 @@ def mm_k(
     b_dtype: tl.constexpr,
     USE_GDC: tl.constexpr,
     base_k: int,
+    FP32_A: tl.constexpr = False,
 ):
     """Given a_ptr and b_ptr, that identify the rows of A (m x k) and columns of
     B (k x n), iterate, through the K dimension to compute the partial/complete
@@ -48,6 +78,8 @@ def mm_k(
         b_dtype: datatype of the B matrix
         USE_GDC: Whether to use PDL. True indicates use.
         base_k: Base offset along K dimension for current SPLIT_K group
+        FP32_A: if True, A is float32 and is used without rounding it to
+            b_dtype (see `_dot_a`).
 
     """
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -72,9 +104,9 @@ def mm_k(
             if USE_GDC:
                 tl.extra.cuda.gdc_wait()
             tiled_a = tl.load(a_ptr)
-            if CAST_TYPE:
-                tiled_a = tiled_a.to(b_dtype)
-            accumulator += tl.dot(tiled_a, tiled_b)
+            accumulator = _dot_a(
+                tiled_a, tiled_b, accumulator, CAST_TYPE, FP32_A, b_dtype
+            )
         else:
             # Check if we need element-wise masking
             if iter_k >= K:
@@ -86,9 +118,9 @@ def mm_k(
                 if USE_GDC:
                     tl.extra.cuda.gdc_wait()
                 tiled_a = tl.load(a_ptr)
-                if CAST_TYPE:
-                    tiled_a = tiled_a.to(b_dtype)
-                accumulator += tl.dot(tiled_a, tiled_b)
+                accumulator = _dot_a(
+                    tiled_a, tiled_b, accumulator, CAST_TYPE, FP32_A, b_dtype
+                )
             else:
                 # Partial block, need masking (only last iteration)
                 k_offsets = tl.arange(0, BLOCK_K)
@@ -97,9 +129,9 @@ def mm_k(
                 if USE_GDC:
                     tl.extra.cuda.gdc_wait()
                 tiled_a = tl.load(a_ptr, mask=mask[None, :], other=0.0)
-                if CAST_TYPE:
-                    tiled_a = tiled_a.to(b_dtype)
-                accumulator += tl.dot(tiled_a, tiled_b)
+                accumulator = _dot_a(
+                    tiled_a, tiled_b, accumulator, CAST_TYPE, FP32_A, b_dtype
+                )
 
         a_ptr += STEP_K * ak_stride
         b_ptr += STEP_K * bk_stride
@@ -142,6 +174,7 @@ def do_expand_kernel(
     ADD_INPUTS: tl.constexpr,
     USE_GDC: tl.constexpr,
     FP32_ADD_INPUTS: tl.constexpr = False,
+    FP32_A: tl.constexpr = False,
 ):
     """Given an array of integers that identifies the rows of A, ram,
     a lora index that identifies which LoRA to use from lora_ptr, lora_index,
@@ -209,6 +242,7 @@ def do_expand_kernel(
         cur_lora_ptr.dtype.element_ty,
         USE_GDC,
         base_k=0,
+        FP32_A=FP32_A,
     )
 
     tiled_c = accumulator.to(cur_lora_ptr.dtype.element_ty)

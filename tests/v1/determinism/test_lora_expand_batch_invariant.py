@@ -27,7 +27,7 @@ def set_batch_invariant(monkeypatch):
 
 
 def _expand(inputs, weights, base, mapping):
-    """Return base + inputs[s] @ weights[s][lora].T per slice s (add_inputs=True)."""
+    """Return `base + inputs[s] @ weights[s][lora].T` per slice (add_inputs=True)."""
     num_tokens = base.size(0)
     meta = LoRAKernelMeta.make(weights[0].size(0), num_tokens, device=DEVICE)
     meta.prepare_tensors(mapping)
@@ -115,3 +115,45 @@ def test_lora_expand_invariant_across_batch_sizes(set_batch_invariant, nslices):
             inputs[:, pos], base[pos], mapping[pos] = x[:, 0], y[0], 1
             out = _expand(inputs, weights, base, mapping)
             assert torch.equal(out[pos], expected), (num_tokens, pos)
+
+
+@skip_if_not_cuda_alike
+@pytest.mark.parametrize("hidden_size,rank,nslices", [(2048, 16, 1), (1024, 64, 3)])
+def test_lora_expand_unrounded_fp32_inputs(
+    set_batch_invariant, hidden_size, rank, nslices
+):
+    """The fp32 shrink output feeds the expand without a bf16 rounding.
+
+    Inputs carry 11 significant bits (bf16 keeps 8), weights and base are
+    multiples of 1/64, so every product and sum is exact in fp32 and the
+    exact result is base + inputs @ weights^T rounded once.
+    """
+    set_random_seed(0)
+    num_tokens, num_loras = 65, 3
+    inputs = torch.randint(-2048, 2048, (nslices, num_tokens, rank), device=DEVICE)
+    inputs = inputs.float() / 4096
+    weights = [
+        (torch.randint(-64, 65, (num_loras, hidden_size, rank), device=DEVICE) / 64).to(
+            torch.bfloat16
+        )
+        for _ in range(nslices)
+    ]
+    base = torch.randint(-256, 257, (num_tokens, nslices * hidden_size), device=DEVICE)
+    base = (base / 64).to(torch.bfloat16)
+    mapping = torch.randint(
+        0, num_loras, (num_tokens,), dtype=torch.int32, device=DEVICE
+    )
+    exact = base.double()
+    for s, weight in enumerate(weights):
+        cols = slice(s * hidden_size, (s + 1) * hidden_size)
+        exact[:, cols] += torch.einsum(
+            "tr,thr->th", inputs[s].double(), weight[mapping.long()].double()
+        )
+    exact = exact.to(torch.bfloat16)
+
+    set_batch_invariant(True)
+    assert torch.equal(_expand(inputs, weights, base, mapping), exact)
+
+    # The default path rounds the inputs to bf16 first.
+    set_batch_invariant(False)
+    assert not torch.equal(_expand(inputs, weights, base, mapping), exact)

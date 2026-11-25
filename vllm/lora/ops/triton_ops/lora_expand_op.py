@@ -53,6 +53,7 @@ def _lora_expand_kernel(
     SAME_STRIDE: tl.constexpr,
     USE_GDC: tl.constexpr,
     FP32_ADD_INPUTS: tl.constexpr,
+    FP32_A: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
     cta_n_num = tl.cdiv(N, BLOCK_N)
@@ -132,6 +133,7 @@ def _lora_expand_kernel(
         ADD_INPUTS,
         USE_GDC,
         FP32_ADD_INPUTS,
+        FP32_A,
     )
 
 
@@ -284,6 +286,9 @@ def _lora_expand(
         # Batch-invariant mode adds the LoRA delta to the base output with a
         # single rounding, matching an fp32 reference of base + delta.
         is_batch_invariant,
+        # It also keeps the fp32 shrink output unrounded, so the delta is the
+        # fp32 x @ A^T @ B^T of a trainer's LoRA forward.
+        CAST_TYPE and is_batch_invariant,
         num_warps=NUM_WARPS,
         num_ctas=NUM_CTAS,
         num_stages=NUM_STAGES,
