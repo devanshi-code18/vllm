@@ -32,7 +32,9 @@ from vllm.models.inkling2.nvidia.ops.block_scales import (  # noqa: E402
 )
 from vllm.models.inkling2.nvidia.ops.linear import linear_k_groups  # noqa: E402
 from vllm.models.inkling2.nvidia.ops.moe_sm90 import (  # noqa: E402
+    ALIGN_WORDS,
     HummingExperts,
+    select_and_align,
     select_experts,
 )
 from vllm.models.inkling2.nvidia.ops.mxfp8 import mxfp8_quantize  # noqa: E402
@@ -755,6 +757,106 @@ def test_padding_tokens_route_to_no_expert(
     out = moe(x)
     assert (out[tokens:] == 0).all()
     torch.testing.assert_close(out[:tokens], expected, atol=0, rtol=0)
+
+
+requires_humming = pytest.mark.skipif(
+    not (
+        current_platform.is_device_capability(90)
+        or current_platform.is_device_capability_family(80)
+    ),
+    reason="Humming experts (Hopper, Ampere and Ada)",
+)
+
+
+def _rows_in_expert_order(sorted_ids, expert_ids, total, block_m, numel):
+    """`sorted_ids` with the rows of each expert sorted (sentinels last)."""
+    expert = expert_ids[torch.arange(total, device="cuda") // block_m].long()
+    key = expert * (numel + 1) + sorted_ids[:total].long()
+    out = sorted_ids.clone()
+    out[:total] = (key.sort().values - expert * (numel + 1)).int()
+    return out
+
+
+@requires_humming
+@pytest.mark.parametrize("tokens", [1, 5, 33, 64, 93, 200, 256])
+@pytest.mark.parametrize("block_sizes", [(8,), (16,), (8, 16)])
+def test_select_and_align_matches_moe_align(tokens: int, block_sizes):
+    """The fused router + Humming row layout vs `select_experts` and
+    `moe_align_block_size`: bitwise the same experts, weights, `src2dst`,
+    block experts and padded row counts; the same rows per expert, in token
+    order (the CUDA kernel places them with atomics, in any order). Covers
+    padding tokens, local experts of one EP rank (64 of 128) and repeated
+    calls, which find the kernel's masks and counters reset."""
+    torch.manual_seed(tokens)
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+    from vllm.models.inkling2.nvidia.ops.moe import NUM_COUNTERS
+
+    experts, hidden = 128, 2304
+    gate = (torch.randn(experts, hidden, device="cuda") * 0.05).bfloat16()
+    bias = torch.randn(experts, device="cuda") * 0.01
+    counters = torch.zeros(NUM_COUNTERS, dtype=torch.int32, device="cuda")
+    for lo, hi in ((0, 128), (32, 96)):
+        bounds = torch.tensor([lo, hi], dtype=torch.int32, device="cuda")
+        masks = torch.zeros((hi - lo) * ALIGN_WORDS, dtype=torch.int32, device="cuda")
+        is_padding = torch.rand(tokens, device="cuda") < 0.25
+        x = torch.randn(tokens, hidden, device="cuda").bfloat16()
+        x[is_padding] = float("nan")
+        ref = select_experts(x, gate, bias, 8, 8.0, bounds, is_padding)
+        for _ in range(2):
+            selected, alignments = select_and_align(
+                x, gate, bias, 8, 8.0, bounds, masks, counters, block_sizes, is_padding
+            )
+            # Padding tokens (NaN rows) have NaN weights but no rows.
+            for actual, expected in zip(selected, ref):
+                torch.testing.assert_close(
+                    actual, expected, atol=0, rtol=0, equal_nan=True
+                )
+            numel = tokens * 8
+            for size in block_sizes:
+                expected = moe_align_block_size(
+                    ref[0], size, hi - lo, ignore_invalid_experts=True
+                )
+                actual = alignments[size]
+                for a, e in zip(actual, expected):
+                    assert a.shape == e.shape
+                torch.testing.assert_close(actual[2], expected[2], atol=0, rtol=0)
+                torch.testing.assert_close(actual[1], expected[1], atol=0, rtol=0)
+                total = actual[2].item()
+                ordered = _rows_in_expert_order(
+                    actual[0], actual[1], total, size, numel
+                )
+                torch.testing.assert_close(actual[0], ordered, atol=0, rtol=0)
+                torch.testing.assert_close(
+                    ordered,
+                    _rows_in_expert_order(expected[0], expected[1], total, size, numel),
+                    atol=0,
+                    rtol=0,
+                )
+            assert not masks.any() and not counters.any()
+
+
+@requires_humming
+@pytest.mark.parametrize("fmt", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize("tokens", [1, 5, 33, 200, 256])
+def test_fused_alignment_moe_layer_matches_moe_align(
+    dist_init, monkeypatch, fmt: str, tokens: int
+):
+    """The layer output with the fused routing is bitwise that of
+    `select_experts` + `moe_align_block_size`, including under CUDA graph
+    replay."""
+    moe = _build_moe(fmt, _random_moe_weights(fmt))
+    x = torch.randn(tokens, 512, device="cuda").bfloat16()
+    fused = moe(x)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = moe(x)
+    graph.replay()
+    monkeypatch.setattr(moe_module, "ALIGN_MAX_TOKENS", 0)
+    expected = moe(x)
+    torch.testing.assert_close(fused, expected, atol=0, rtol=0)
+    torch.testing.assert_close(replayed, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("hidden", [512, 2304, 4608])

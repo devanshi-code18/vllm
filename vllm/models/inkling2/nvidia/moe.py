@@ -30,7 +30,13 @@ from .ops.activation import swiglu_quantize
 from .ops.block_scales import shuffle_rows, swizzle_block_scales
 from .ops.moe import NUM_COUNTERS, combine, combine_push, route
 from .ops.moe_humming import HummingNVFP4Experts
-from .ops.moe_sm90 import HummingExperts, select_experts
+from .ops.moe_sm90 import (
+    ALIGN_MAX_TOKENS,
+    ALIGN_WORDS,
+    HummingExperts,
+    select_and_align,
+    select_experts,
+)
 from .ops.moe_sm120 import bmm as bmm_sm120
 from .ops.seq_parallel import SeqParallel
 from .ops.trtllm_bmm import bmm, expert_plan, load_kernels
@@ -157,6 +163,18 @@ class Inkling2Experts(nn.Module):
             and vllm_config.kernel_config.moe_backend == "humming"
         )
         self.humming: HummingExperts | None = None
+        # Ampere and Hopper (Humming experts) select the experts and lay out
+        # their rows in one launch for small batches (`select_and_align`).
+        self.fused_align = current_platform.is_device_capability_family(
+            80
+        ) or current_platform.is_device_capability(90)
+        if self.fused_align:
+            # Token masks of each local expert (reset by the kernel).
+            self.register_buffer(
+                "token_masks",
+                torch.zeros(self.num_experts * ALIGN_WORDS, dtype=torch.int32),
+                persistent=False,
+            )
         if self.sm100:
             load_kernels(
                 (self.w13_weight, self.w2_weight),
@@ -268,8 +286,9 @@ class Inkling2Experts(nn.Module):
         push: SeqParallel | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
         """`routing` and `quantized` (`x` in the expert layout) are from
-        `ops.moe.route` (on Hopper, `routing` is from
-        `ops.moe_sm90.select_experts` and `quantized` is None). The routing
+        `ops.moe.route` (on Hopper and Ampere, `routing` is
+        `ops.moe_sm90.select_experts` followed by the row layouts of
+        `ops.moe_sm90.select_and_align` or None, and `quantized` is None). The routing
         weight is applied inside the SwiGLU, before the down projection.
         Without `reduce`, returns the local expert rows and `src2dst` for
         the consumer to combine and reduce, or pushes their combine to the
@@ -291,7 +310,7 @@ class Inkling2Experts(nn.Module):
             down = self._gemm(activated, "w2", tiles, plan, 1)
         else:
             assert self.humming is not None, "process_weights_after_loading"
-            ids, gammas, src2dst = routing
+            ids, gammas, src2dst, alignments = routing
             down = self.humming(
                 x,
                 ids,
@@ -300,6 +319,7 @@ class Inkling2Experts(nn.Module):
                 self.num_experts * self.ep_size,
                 self.gate_cap,
                 self.up_cap,
+                alignments,
             )
         if push is not None:
             # Each rank's fp32 combine is rounded once to bf16.
@@ -383,16 +403,40 @@ class Inkling2MoE(nn.Module):
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
             is_padding = get_forward_context().is_padding
         if not (experts.sm100 or experts.sm120):
-            selected = select_experts(
-                x,
-                gate.weight,
-                gate.bias,
-                gate.topk,
-                gate.route_scale,
-                experts.expert_bounds,
-                is_padding,
-            )
-            return experts(x, selected, None, None, reduce, push)
+            tokens = x.shape[0]
+            if (
+                experts.fused_align
+                and tokens <= ALIGN_MAX_TOKENS
+                and isinstance(experts.humming, HummingExperts)
+            ):
+                block_m = experts.humming.block_sizes(
+                    tokens * gate.topk, gate.weight.shape[0]
+                )
+                selected, alignments = select_and_align(
+                    x,
+                    gate.weight,
+                    gate.bias,
+                    gate.topk,
+                    gate.route_scale,
+                    experts.expert_bounds,
+                    experts.token_masks,
+                    gate.counters,
+                    tuple(dict.fromkeys(block_m.values())),
+                    is_padding,
+                )
+                routing = (*selected, alignments)
+            else:
+                selected = select_experts(
+                    x,
+                    gate.weight,
+                    gate.bias,
+                    gate.topk,
+                    gate.route_scale,
+                    experts.expert_bounds,
+                    is_padding,
+                )
+                routing = (*selected, None)
+            return experts(x, routing, None, None, reduce, push)
         plan = experts.plan(x.shape[0])
         routing, quantized = route(
             x,
