@@ -258,6 +258,58 @@ def test_tiny_looped_model_batch_invariant(
             assert steps(again[i]) == target, f"target {i} changed with a cache hit"
 
 
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(80),
+    reason="Inkling2 batch invariance is validated on A100",
+)
+def test_tiny_looped_model_conv_tail_only(tmp_path, monkeypatch, enable_pickle):
+    """VLLM_INKLING2_CONV_TAIL=1 backs only the conv-state rows a later step
+    reads; tokens and logprob bits must match the dense conv cache through
+    chunked prefill (chunks read the previous chunk's last 3 rows) and
+    prefix-cache hits (which resume on a retained 64-token boundary)."""
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    (tmp_path / "config.json").write_text(json.dumps(TINY_LOOP_CONFIG))
+    shared = [2 + (5 * j) % 990 for j in range(300)]
+    prompts = [list(range(2, 602)), shared + [11, 12, 13], shared + list(range(40, 77))]
+    params = SamplingParams(
+        max_tokens=16, temperature=0, logprobs=0, ignore_eos=True, detokenize=False
+    )
+
+    def run(tail_only: bool) -> list[tuple[list[int], list[float], int]]:
+        monkeypatch.setenv("VLLM_INKLING2_CONV_TAIL", "1" if tail_only else "0")
+        llm = LLM(
+            model=str(tmp_path),
+            load_format="dummy",
+            skip_tokenizer_init=True,
+            tokenizer_mode="hf",
+            gpu_memory_utilization=0.10,
+            max_num_batched_tokens=256,
+            max_model_len=2048,
+            max_num_seqs=4,
+            enable_prefix_caching=True,
+            limit_mm_per_prompt={"image": 0},
+        )
+        llm.apply_model(_redraw_loop_controllers)
+        llm.apply_model(_redraw_attention)
+        results = []
+        for prompt in prompts:
+            out = llm.generate([{"prompt_token_ids": prompt}], params)[0]
+            seq = out.outputs[0]
+            assert seq.logprobs is not None
+            logprobs = [lp[t].logprob for t, lp in zip(seq.token_ids, seq.logprobs)]
+            results.append((list(seq.token_ids), logprobs, out.num_cached_tokens))
+        del llm
+        cleanup_dist_env_and_memory()
+        return results
+
+    dense = run(tail_only=False)
+    tail = run(tail_only=True)
+    assert [r[2] for r in tail] == [r[2] for r in dense]
+    assert tail[2][2] > 0, "the third prompt should hit the shared prefix"
+    assert tail == dense
+
+
 def test_loop_serving_options_validation(tmp_path):
     """The pass-count and shared-cache options need a variable-loop
     checkpoint, and DSpark the checkpoint's pass count; looped checkpoints

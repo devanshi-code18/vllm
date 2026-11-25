@@ -32,6 +32,10 @@ from . import use_pdl
 from .e4m3 import cast_store, e4m3_arg
 from .pdl import gdc_launch_dependents, gdc_wait
 
+# A token's flat conv-state slot when no later step reads its input: the
+# conv still runs, the write is skipped (-1 marks padding, no conv).
+SKIP_WRITE_SLOT = -2
+
 
 @triton.jit
 def _cached_taps(
@@ -202,7 +206,7 @@ def _conv(
     stride_w1,
     pos_ptr,  # [T] absolute positions
     seq_idx_ptr,  # [T] request of each token
-    slot_ptr,  # [T] flat cache slot (< 0: padding)
+    slot_ptr,  # [T] flat cache slot (-1: padding, -2: no write)
     block_table_ptr,  # [num_reqs, max_blocks]
     stride_bt,
     max_blocks,
@@ -227,7 +231,8 @@ def _conv(
     """
     tc_mask = t_mask[:, None] & c_mask[None, :]
     slot = tl.load(slot_ptr + toff, mask=t_mask, other=-1)
-    valid = slot >= 0
+    # SKIP_WRITE_SLOT (-2): a real token whose input no later step reads.
+    valid = (slot >= 0) | (slot == -2)
     pos = tl.load(pos_ptr + toff, mask=t_mask, other=0)
     req = tl.load(seq_idx_ptr + toff, mask=t_mask, other=0)
     qstart = tl.load(qstart_ptr + toff, mask=t_mask, other=0)
@@ -265,7 +270,7 @@ def _conv(
         + (safe_slot % N)[:, None] * stride_c_n
         + cache_col[None, :]
     )
-    tl.store(dst, cur, mask=tc_mask & valid[:, None])
+    tl.store(dst, cur, mask=tc_mask & (slot >= 0)[:, None])
 
     tap_args = (
         x_ptr,
