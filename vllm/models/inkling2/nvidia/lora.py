@@ -165,8 +165,9 @@ class Inkling2MoEWithLoRA(BaseLayerWithLoRA):
         reduce: bool = True,
         push: SeqParallel | None = None,
         pass_idx: int = 0,
+        skip: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
-        return self.base_layer(x, reduce, push, lora=self, pass_idx=pass_idx)
+        return self.base_layer(x, reduce, push, lora=self, pass_idx=pass_idx, skip=skip)
 
     def add_w13(
         self,
