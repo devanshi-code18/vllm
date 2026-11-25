@@ -780,7 +780,13 @@ class CudaPlatformBase(Platform):
         # TODO(Laurawly/luka): remove this env var,
         #  users can just use IR op priority directly
         rms_norm = default
-        if envs.VLLM_USE_OINK_OPS:
+        if envs.VLLM_BATCH_INVARIANT:
+            # Inductor sizes the reduction block of a generated RMSNorm kernel
+            # from the compile range's size hint (max_num_batched_tokens), which
+            # changes its summation order. The C kernels launch a fixed block
+            # under batch invariance.
+            rms_norm = ["vllm_c", "native"]
+        elif envs.VLLM_USE_OINK_OPS:
             rms_norm = ["oink"] + default
 
         rotary_embedding = default

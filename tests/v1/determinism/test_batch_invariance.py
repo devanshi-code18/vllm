@@ -13,6 +13,7 @@ from utils import (
     _extract_step_logprobs,
     _prompt_with_tokens,
     _random_prompt,
+    skip_if_not_cuda,
     skip_if_not_cuda_alike,
     skip_unsupported,
 )
@@ -449,6 +450,62 @@ def test_logprobs_bitwise_batch_invariance_ragged_chunked_prefill(backend):
     finally:
         with contextlib.suppress(Exception):
             llm.llm_engine.engine_core.shutdown()
+
+
+@skip_if_not_cuda
+@pytest.mark.timeout(1000)
+def test_logprobs_bitwise_across_max_num_batched_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The bits of a request must not depend on max_num_batched_tokens.
+
+    Each torch.compile range is built with max_num_batched_tokens as its size
+    hint, and Inductor sizes the reduction block of a generated kernel from that
+    hint. OLMo-2 normalizes q and k over the full hidden size, and Inductor fuses
+    both norms with RoPE into one such kernel. Batch invariance skips
+    torch.compile where a tuned matmul table covers the model (OLMo-2 on SM89+),
+    so the test forces compile.
+    """
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
+    monkeypatch.setattr(envs, "VLLM_USE_BREAKABLE_CUDAGRAPH", False)
+    random.seed(int(os.getenv("VLLM_TEST_SEED", "12345")))
+    prompts = [_random_prompt(100, 300) for _ in range(8)]
+    sp = SamplingParams(temperature=0.0, max_tokens=32, logprobs=1)
+
+    results = {}
+    for max_num_batched_tokens in (512, 8192):
+        llm = LLM(
+            model="allenai/OLMo-2-0425-1B",
+            dtype="bfloat16",
+            max_num_seqs=len(prompts),
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_model_len=1024,
+            enable_prefix_caching=False,
+            gpu_memory_utilization=float(
+                os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.5")
+            ),
+        )
+        try:
+            outs = llm.generate(prompts, sp, use_tqdm=False)
+            results[max_num_batched_tokens] = [_extract_step_logprobs(o) for o in outs]
+        finally:
+            with contextlib.suppress(Exception):
+                llm.llm_engine.engine_core.shutdown()
+            del llm
+
+    mismatches = []
+    for i, ((lp_a, tok_a), (lp_b, tok_b)) in enumerate(
+        zip(results[512], results[8192])
+    ):
+        if tok_a != tok_b:
+            mismatches.append(f"prompt {i}: tokens differ")
+        elif not torch.equal(lp_a, lp_b):
+            delta = torch.max(torch.abs(lp_a - lp_b)).item()
+            mismatches.append(f"prompt {i}: logprobs differ, max|delta|={delta:.3e}")
+    assert not mismatches, (
+        "max_num_batched_tokens 512 vs 8192 changed the output: "
+        + "; ".join(mismatches)
+    )
 
 
 @skip_unsupported

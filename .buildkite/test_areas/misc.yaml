@@ -979,6 +979,7 @@ steps:
     - vllm/model_executor/kernels/linear
     - vllm/model_executor/determinism
     - tests/v1/determinism/
+    - vllm/platforms/cuda.py
   commands:
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
     - pytest -v -s v1/determinism/test_batch_invariance.py
@@ -1029,6 +1030,7 @@ steps:
     - vllm/model_executor/kernels/linear
     - vllm/model_executor/determinism
     - tests/v1/determinism/
+    - vllm/platforms/cuda.py
   commands:
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
     - pytest -v -s v1/determinism/test_batch_invariance.py
