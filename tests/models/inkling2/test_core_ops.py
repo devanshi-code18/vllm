@@ -292,6 +292,57 @@ def test_loop_blend_matches_per_stream_controllers(tokens):
         torch.testing.assert_close(out[s].float(), ref.float(), atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("rank", [16, 64])
+@pytest.mark.parametrize("tokens", [1, 8, 32, 256])
+@pytest.mark.parametrize("streams,broadcast", [(3, True), (3, False), (1, False)])
+def test_fused_loop_blend_rounds_like_fp64_controller(tokens, streams, broadcast, rank):
+    """The fused small-batch controllers (the attention q/k/v streams, as a
+    local layer or a full layer, and the MLP stream) against an fp64
+    controller with the reference's bf16 roundings of the pair and the
+    hidden state: at most 3% of outputs miss the correctly rounded bf16 (a
+    hidden value on a rounding boundary moves its whole row), and each row is
+    deterministic and independent of the rest of the batch."""
+    from vllm.models.inkling2.nvidia.ops.loop import (
+        fused_controller,
+        use_fused_controller,
+    )
+
+    dim = 2304
+    gen = torch.Generator(device=DEVICE).manual_seed(tokens * 10 + streams)
+
+    def randn(*shape):
+        return torch.randn(*shape, device=DEVICE, generator=gen)
+
+    down = (randn(streams, rank, 2 * dim) * 0.02).bfloat16()
+    up = (randn(streams, 2 * dim, rank) * 0.1).bfloat16()
+    lead = 1 if broadcast else streams
+    dest = randn(lead, tokens, dim).expand(streams, -1, -1)
+    message = randn(streams, tokens, dim)
+    norm_weight = randn(lead, dim).bfloat16().expand(streams, -1)
+    assert use_fused_controller(message)
+
+    out = fused_controller(dest, message, down, up, norm_weight, 1e-6)
+
+    d, m = dest.double(), message.double()
+
+    def rms(x):
+        return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-6)
+
+    pair = torch.cat([rms(d), rms(m)], -1).bfloat16().double()
+    hidden = (pair @ down.double().transpose(1, 2)).bfloat16().double()
+    gain_forget = hidden @ up.double().transpose(1, 2)
+    gain, forget = gain_forget.tanh().split(dim, -1)
+    ref = rms((1 - forget) * d + gain * m) * norm_weight.double()[:, None]
+    torch.testing.assert_close(out.double(), ref, atol=2e-2, rtol=2e-2)
+    assert (out.double() != ref.bfloat16().double()).float().mean() < 0.03
+    again = fused_controller(dest, message, down, up, norm_weight, 1e-6)
+    assert torch.equal(out, again)
+    first = fused_controller(
+        dest[:, :1], message[:, :1].contiguous(), down, up, norm_weight, 1e-6
+    )
+    assert torch.equal(first[:, 0], out[:, 0])
+
+
 def _dense_conv(x, weight, dyn):
     """Torch reference over whole sequences; x: (L, C)."""
     width = weight.shape[0] if dyn is not None else weight.shape[1]
