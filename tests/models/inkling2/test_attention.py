@@ -503,6 +503,75 @@ def test_inkling2_decode_attention_after_prologue(is_local, num_splits):
         torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
 
+@requires_sm90
+@pytest.mark.parametrize("is_local", [False, True])
+@torch.inference_mode()
+def test_inkling2_decode_attention_batch_invariant(is_local, monkeypatch):
+    """With VLLM_BATCH_INVARIANT=1, a request decodes to the same bits alone
+    and in a batch (split count and tiles do not follow the batch)."""
+    from vllm import envs
+    from vllm.models.inkling2.nvidia.ops.attention import (
+        plan_decode_attention,
+        rel_decode_attention,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    torch.manual_seed(0)
+    device = "cuda"
+    heads, kv_heads, d_rel, page = 24, 8, 16, 128
+    q_lens, kv_lens = [8, 8, 1, 3, 8, 8], [1300, 700, 2000, 64, 1100, 3000]
+    max_blocks = -(-max(kv_lens) // page)
+    kv = torch.randn(len(q_lens) * max_blocks + 1, page, kv_heads, 2 * HEAD_DIM)
+    key_cache, value_cache = kv.to(device, torch.bfloat16).split(HEAD_DIM, dim=-1)
+    block_table = torch.randperm(kv.shape[0] - 1, device=device).int() + 1
+    block_table = block_table.view(len(q_lens), max_blocks)
+    num_tokens = sum(q_lens)
+    q = torch.randn(num_tokens, heads, HEAD_DIM, device=device).bfloat16()
+    r = (torch.randn(num_tokens, heads, d_rel, device=device) * 2).bfloat16()
+    proj = torch.randn(num_tokens, heads * (HEAD_DIM + 1), device=device).bfloat16()
+    gate, sinks = proj[:, : heads * HEAD_DIM], proj[:, heads * HEAD_DIM :]
+    rel_proj = torch.randn(d_rel, REL_EXTENT, device=device).bfloat16()
+    seqs = list(zip(q_lens, kv_lens))
+    rel_logits = r.float() @ rel_proj.float()
+
+    def decode(num_reqs):
+        n = sum(q_lens[:num_reqs])
+        out = torch.full((n, heads * HEAD_DIM), float("nan"), device=device)
+        out = out.bfloat16()
+        cu = torch.tensor([0, *q_lens[:num_reqs]], device=device).cumsum(0).int()
+        max_q = max(q_lens[:num_reqs])
+        num_splits = plan_decode_attention(
+            is_local, num_reqs, max_q, heads, kv_heads, REL_EXTENT
+        )
+        rel = shear_rel_logits(
+            rel_logits[:n].bfloat16(), seqs[:num_reqs], 128, is_local
+        )
+        rel_decode_attention(
+            q[:n],
+            key_cache,
+            value_cache,
+            rel,
+            gate[:n],
+            sinks[:n],
+            out,
+            block_table=block_table[:num_reqs],
+            cache_seqlens=torch.tensor(kv_lens[:num_reqs], device=device).int(),
+            cu_seqlens_q=cu,
+            max_query_len=max_q,
+            num_actual_tokens=n,
+            softmax_scale=HEAD_DIM**-0.5,
+            is_local=is_local,
+            num_splits=num_splits,
+        )
+        return out, num_splits
+
+    alone, splits_alone = decode(1)
+    batch, splits_batch = decode(len(q_lens))
+    assert splits_alone == splits_batch
+    assert torch.equal(alone.view(torch.int16), batch[: q_lens[0]].view(torch.int16))
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
 @pytest.mark.parametrize("num_tokens", [1, 300])
 def test_gate_sink(num_tokens):

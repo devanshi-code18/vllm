@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
@@ -21,7 +22,7 @@ from vllm.triton_utils import gl, gluon, tl, tldevice, triton
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 
-from . import use_sm100_kernels
+from . import use_sm80_decode_plan, use_sm100_kernels
 from .attention_sm90 import MODE_GATED, MODE_PARTIAL, rel_attention
 
 # Full-layer FA4 split estimate, fitted on GB200 over uniform and mixed
@@ -393,17 +394,54 @@ def plan_decode_attention(
     split up to twice the work of verify. Full layers give each request and
     KV head `num_sms / 8` splits, fewer once that exceeds 6 CTAs per SM,
     but never less than one CTA per SM. The count depends only on the batch,
-    not the KV lengths, so it holds for every replay of a CUDA graph.
+    not the KV lengths, so it holds for every replay of a CUDA graph. A100
+    uses its measured counts (`_sm80_decode_splits`); batch-invariant mode
+    runs one split for any batch.
     """
     if max_query_len > _VERIFY_BLOCK_M // (num_heads // num_kv_heads):
         return 0
+    if envs.VLLM_BATCH_INVARIANT:
+        # One split and fixed tiles: every request reads its keys in one
+        # order whatever the batch (the merge launch's layout follows it).
+        return 1
     work = num_reqs * num_kv_heads
+    if use_sm80_decode_plan():
+        return _sm80_decode_splits(is_local, work, max_query_len)
     num_sms = num_compute_units()
     if is_local:
         if work <= (16 if max_query_len <= 2 else 8):
             return triton.cdiv(rel_extent - 1, _FA4_BLOCK_N) + 1
         return 5 if work <= 16 else 3 if work <= 32 else 2 if work <= 64 else 1
     return max(num_sms // work, min(num_sms // 8, 6 * num_sms // work))
+
+
+def _sm80_decode_splits(is_local: bool, work: int, max_query_len: int) -> int:
+    """Split counts measured on A100 (108 SMs; per-kernel medians of CUDA
+    graph replays at 1/8/32 requests, 1 and 8 query tokens). One request
+    reads its window or keys in 9-12 splits; at 8 requests and more, few
+    splits of narrower key blocks (`_sm80_decode_tiles`) beat the wide
+    one-split CTAs."""
+    verify = max_query_len > 2
+    if work <= 8:
+        return 9 if is_local and not verify else 12
+    if work <= 32:
+        return 6
+    if work <= 64:
+        return 3 if is_local else 5
+    return 2 if verify else 3
+
+
+def _sm80_decode_tiles(
+    num_splits: int, work: int, verify: bool
+) -> tuple[int, int, int]:
+    """`(BLOCK_N, num_warps, num_stages)` of `_rel_attention_kernel` for an
+    `_sm80_decode_splits` launch (the same for any batch in batch-invariant
+    mode, which runs one split)."""
+    if num_splits >= 8:
+        return 128, 8 if verify else 4, 3
+    if envs.VLLM_BATCH_INVARIANT:
+        return 64, 4, 2
+    return 64, 4, 3 if work <= 64 else 2
 
 
 _EX2_ASM = tl.constexpr("ex2.approx.ftz.f32 $0, $1;")
@@ -1256,6 +1294,11 @@ def _decode_attention(
             draft,
         )
     else:
+        tiles = None
+        if use_sm80_decode_plan():
+            tiles = _sm80_decode_tiles(
+                num_splits, cache_seqlens.shape[0] * num_kv_heads, max_query_len > 2
+            )
         rel_attention(
             q,
             key_cache,
@@ -1273,6 +1316,7 @@ def _decode_attention(
             window=window,
             num_splits=num_splits,
             mode=MODE_GATED if fuse_gate else MODE_PARTIAL,
+            tiles=tiles,
         )
     if fuse_gate:
         out[num_actual_tokens:].zero_()

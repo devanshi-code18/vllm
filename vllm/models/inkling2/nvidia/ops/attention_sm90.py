@@ -254,6 +254,7 @@ def rel_attention(
     window: int,
     num_splits: int,
     mode: int,
+    tiles: tuple[int, int, int] | None = None,
 ) -> None:
     """Launch `_rel_attention_kernel` over the requests of `cu_seqlens_q`.
 
@@ -264,7 +265,8 @@ def rel_attention(
     fp32 `out` `(T, H, D)` and natural-log `lse` `(H, T)`; `MODE_GATED`
     the bf16 `(T, H * D)` `out` (gated by `gate` and `sinks` unless
     drafting; a single split); `MODE_PARTIAL` the fp32 `out`
-    `(S, T, H, D)` and log2 `lse` `(S, T, H)` partials.
+    `(S, T, H, D)` and log2 `lse` `(S, T, H)` partials. `tiles` overrides
+    the `(BLOCK_N, num_warps, num_stages)` picked from the query rows.
     """
     num_tokens, num_heads, head_dim = q.shape
     page, num_kv_heads = key_cache.shape[1:3]
@@ -288,6 +290,13 @@ def rel_attention(
     if lse is None:
         lse = out
     block_m = _block_m(max_query_len, group)
+    if tiles is None:
+        tiles = (
+            64 if block_m >= 128 else 128 if block_m <= 32 else 64,
+            8 if block_m >= 128 else 4,
+            2,
+        )
+    block_n, num_warps, num_stages = tiles
     tokens_per_tile = block_m // group
     num_reqs = cache_seqlens.shape[0]
     grid = (
@@ -337,7 +346,7 @@ def rel_attention(
         DRAFT=draft,
         MODE=mode,
         BLOCK_M=block_m,
-        BLOCK_N=64 if block_m >= 128 else 128 if block_m <= 32 else 64,
-        num_warps=8 if block_m >= 128 else 4,
-        num_stages=2,
+        BLOCK_N=block_n,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )

@@ -11,3 +11,13 @@ def use_sm100_kernels() -> bool:
     from vllm.platforms import current_platform
 
     return current_platform.is_device_capability_family(100)
+
+
+@functools.cache
+def use_sm80_decode_plan() -> bool:
+    """Whether decode/verify attention uses the split counts and tiles
+    measured on A100 (`plan_decode_attention`); other GPUs keep the
+    defaults."""
+    from vllm.platforms import current_platform
+
+    return current_platform.is_device_capability(80)
