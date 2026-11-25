@@ -974,7 +974,8 @@ steps:
   source_file_dependencies:
     - vllm/v1/attention
     - vllm/model_executor/layers
-    - vllm/lora/ops/triton_ops
+    - vllm/lora
+    - vllm/v1/worker/gpu/sample/prompt_logprob.py
     - vllm/model_executor/kernels/linear
     - vllm/model_executor/determinism
     - tests/v1/determinism/
@@ -983,6 +984,7 @@ steps:
     - pytest -v -s v1/determinism/test_batch_invariance.py
     - pytest -v -s v1/determinism/test_rms_norm_batch_invariant.py
     - pytest -v -s v1/determinism/test_lora_shrink_batch_invariant.py
+    - pytest -v -s v1/determinism/test_lora_batch_invariance.py
     - VLLM_TEST_MODEL=deepseek-ai/DeepSeek-V2-Lite-Chat pytest -v -s v1/determinism/test_batch_invariance.py::test_v1_generation_is_deterministic_across_batch_sizes_with_needle -k TRITON_MLA
     - VLLM_TEST_MODEL=Qwen/Qwen3-30B-A3B-Thinking-2507-FP8 pytest -v -s v1/determinism/test_batch_invariance.py::test_v1_generation_is_deterministic_across_batch_sizes_with_needle -k FLASH_ATTN
   mirror:
@@ -999,7 +1001,8 @@ steps:
       source_file_dependencies:
       - vllm/v1/attention
       - vllm/model_executor/layers
-      - vllm/lora/ops/triton_ops
+      - vllm/lora
+      - vllm/v1/worker/gpu/sample/prompt_logprob.py
       - vllm/model_executor/kernels/linear
       - vllm/model_executor/determinism
       - tests/v1/determinism/
@@ -1010,6 +1013,7 @@ steps:
       - pytest -v -s v1/determinism/test_batch_invariance.py
       - pytest -v -s v1/determinism/test_rms_norm_batch_invariant.py
       - pytest -v -s v1/determinism/test_lora_shrink_batch_invariant.py
+      - pytest -v -s v1/determinism/test_lora_batch_invariance.py
       - pytest -v -s v1/determinism/test_cutlass_batch_invariance.py
       - pytest -v -s v1/determinism/test_matmul_batch_invariant.py
       - VLLM_TEST_MODEL=deepseek-ai/DeepSeek-V2-Lite-Chat pytest -v -s v1/determinism/test_batch_invariance.py::test_v1_generation_is_deterministic_across_batch_sizes_with_needle -k TRITON_MLA
@@ -1023,7 +1027,8 @@ steps:
   source_file_dependencies:
     - vllm/v1/attention
     - vllm/model_executor/layers
-    - vllm/lora/ops/triton_ops
+    - vllm/lora
+    - vllm/v1/worker/gpu/sample/prompt_logprob.py
     - vllm/model_executor/kernels/linear
     - vllm/model_executor/determinism
     - tests/v1/determinism/
@@ -1032,6 +1037,7 @@ steps:
     - pytest -v -s v1/determinism/test_batch_invariance.py
     - pytest -v -s v1/determinism/test_rms_norm_batch_invariant.py
     - pytest -v -s v1/determinism/test_lora_shrink_batch_invariant.py
+    - pytest -v -s v1/determinism/test_lora_batch_invariance.py
     - pytest -v -s v1/determinism/test_batch_invariance_vlm.py
     - VLLM_TEST_MODEL=deepseek-ai/DeepSeek-V2-Lite-Chat pytest -v -s v1/determinism/test_batch_invariance.py::test_v1_generation_is_deterministic_across_batch_sizes_with_needle -k TRITON_MLA
     - VLLM_TEST_MODEL=Qwen/Qwen3-30B-A3B-Thinking-2507-FP8 pytest -v -s v1/determinism/test_batch_invariance.py::test_v1_generation_is_deterministic_across_batch_sizes_with_needle -k FLASH_ATTN
@@ -1051,7 +1057,8 @@ steps:
       source_file_dependencies:
       - vllm/v1/attention
       - vllm/model_executor/layers
-      - vllm/lora/ops/triton_ops
+      - vllm/lora
+      - vllm/v1/worker/gpu/sample/prompt_logprob.py
       - vllm/model_executor/kernels/linear
       - vllm/model_executor/determinism
       - tests/v1/determinism/
@@ -1062,6 +1069,7 @@ steps:
       - pytest -v -s v1/determinism/test_batch_invariance.py
       - pytest -v -s v1/determinism/test_rms_norm_batch_invariant.py
       - pytest -v -s v1/determinism/test_lora_shrink_batch_invariant.py
+      - pytest -v -s v1/determinism/test_lora_batch_invariance.py
       - pytest -v -s v1/determinism/test_batch_invariance_vlm.py
       - VLLM_TEST_MODEL=deepseek-ai/DeepSeek-V2-Lite-Chat pytest -v -s v1/determinism/test_batch_invariance.py::test_v1_generation_is_deterministic_across_batch_sizes_with_needle -k TRITON_MLA
       - VLLM_TEST_MODEL=Qwen/Qwen3-30B-A3B-Thinking-2507-FP8 pytest -v -s v1/determinism/test_batch_invariance.py::test_v1_generation_is_deterministic_across_batch_sizes_with_needle -k TRITON_ATTN
