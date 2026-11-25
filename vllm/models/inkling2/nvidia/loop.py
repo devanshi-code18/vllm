@@ -29,7 +29,12 @@ from .model import (
 from .ops.attn_res import attn_res
 from .ops.linear import linear_k_groups
 from .ops.ll_gemm_sm120 import sm12x_bf16_ll_gemm, use_sm12x_bf16_ll_gemm
-from .ops.loop import blend_rms_norm, pair_rms_norm
+from .ops.loop import (
+    blend_rms_norm,
+    fused_controller,
+    pair_rms_norm,
+    use_fused_controller,
+)
 from .sconv import conv_metadata
 
 LOOP_STREAMS = ("attn", "k", "v", "mlp")
@@ -121,9 +126,11 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
         """The `streams` controllers on fp32 `(S, T, D)` `dest` (may
         broadcast over streams) and `message`, each output RMS-normalized
         with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
-        pair = pair_rms_norm(dest, message)
         down = self.controller_down[streams]
         up = self.controller_gain_forget[streams]
+        if use_fused_controller(message):
+            return fused_controller(dest, message, down, up, norm_weight, norm_eps)
+        pair = pair_rms_norm(dest, message)
         if use_sm12x_bf16_ll_gemm(pair, down):
             hidden = sm12x_bf16_ll_gemm(pair, down)
             gain_forget = sm12x_bf16_ll_gemm(hidden, up, out_dtype=torch.float32)
