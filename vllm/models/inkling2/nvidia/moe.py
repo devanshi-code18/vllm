@@ -358,13 +358,15 @@ class Inkling2MoE(nn.Module):
         push: SeqParallel | None = None,
         lora: ExpertsLoRA | None = None,
         pass_idx: int = 0,
+        skip: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
         """bf16 [T, H] -> bf16 [T, H], reduced over the expert-parallel group;
         without `reduce`, the unreduced `(down, src2dst)` of
         `Inkling2Experts`, or (with `push`) pushes this rank's partial sums
         to the token shard owners.
         Padding tokens (`is_padding` of the forward context) are routed to
-        no expert and come out as 0. `lora` (`Inkling2MoEWithLoRA`) adds
+        no expert and come out as 0, as do the rows of the bool `skip`
+        (loop rows past their pass count). `lora` (`Inkling2MoEWithLoRA`) adds
         per-expert LoRA deltas inside the expert GEMMs, before any reduce or
         push; the NVFP4 / MXFP8 experts here do not support it. With
         routed-experts capture, the expert ids are recorded at the row of
@@ -382,6 +384,8 @@ class Inkling2MoE(nn.Module):
         is_padding = None
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
             is_padding = get_forward_context().is_padding
+        if skip is not None:
+            is_padding = skip if is_padding is None else is_padding | skip
         if not (experts.sm100 or experts.sm120):
             selected = select_experts(
                 x,

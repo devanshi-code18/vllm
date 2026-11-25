@@ -225,12 +225,14 @@ class Inkling2LoopModel(Inkling2Model):
         positions: torch.Tensor,
         tau: torch.Tensor | None,
         plan: list[tuple[bool, bool]],
+        skip: torch.Tensor | None = None,
     ) -> tuple[int, torch.Tensor]:
         """Run decoder layer `i` in loop pass `pass_idx` on its `inputs`
         (the attention inputs; for a visit with messages from `bank`, the
         fp32 mixes they blend into). Returns the number of completed AttnRes
         blocks after it and the mixes of its output with `next_query` through
-        `next_norm` (fp32 without it), the next visit's inputs."""
+        `next_norm` (fp32 without it), the next visit's inputs. Rows of the
+        bool `skip` (past their pass count) skip the experts."""
         layer = self.layers[i]
         partial = stack[num_blocks]
         owner = layer.conv_states[pass_idx]
@@ -314,7 +316,9 @@ class Inkling2LoopModel(Inkling2Model):
             outputs = layer.mlp_sconv.all_reduce_mix(
                 workspace,
                 *mix_args,
-                combine=layer.mlp(mlp_in[0], reduce=False, pass_idx=pass_idx),
+                combine=layer.mlp(
+                    mlp_in[0], reduce=False, pass_idx=pass_idx, skip=skip
+                ),
                 addend=attn_out,
                 residual=residual,
                 two_shot=moe_two_shot,
@@ -323,7 +327,7 @@ class Inkling2LoopModel(Inkling2Model):
         else:
             # The MoE output is all-reduced (in bf16) inside layer.mlp.
             outputs = layer.mlp_sconv.conv_mix(
-                layer.mlp(mlp_in[0], pass_idx=pass_idx),
+                layer.mlp(mlp_in[0], pass_idx=pass_idx, skip=skip),
                 *mix_args,
                 addend=attn_out,
                 residual=residual,
@@ -354,6 +358,7 @@ class Inkling2LoopModel(Inkling2Model):
         )
         per_row = loop_passes is not None and num_passes > 1
         kept: tuple[torch.Tensor, torch.Tensor] | None = None
+        skip: torch.Tensor | None = None
         stack = inputs_embeds.new_empty(
             (self._max_loop_blocks() + 1, num_tokens, hidden)
         )
@@ -380,6 +385,10 @@ class Inkling2LoopModel(Inkling2Model):
                 prelude_blocks = num_blocks
                 prelude_partial = stack[num_blocks].clone()
             elif i == core.start:
+                if per_row:
+                    assert loop_passes is not None
+                    # Rows past their pass count skip the experts.
+                    skip = loop_passes <= pass_idx
                 # Every pass restarts from the prelude's state, with the
                 # previous pass's blocks (after the prelude's) and partial as
                 # the messages' bank.
@@ -424,6 +433,7 @@ class Inkling2LoopModel(Inkling2Model):
                 positions,
                 tau,
                 plan,
+                skip if looped else None,
             )
             if per_row and i == core.stop - 1:
                 assert loop_passes is not None and prelude_blocks is not None
