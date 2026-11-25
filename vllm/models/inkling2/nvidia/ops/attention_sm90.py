@@ -16,6 +16,7 @@ holds for every replay of a CUDA graph.
 
 import torch
 
+from vllm import envs
 from vllm.triton_utils import tl, triton
 
 from .e4m3 import _NATIVE_E4M3, _e4m3_f16, e4m3_arg
@@ -242,6 +243,18 @@ def _block_m(max_query_len: int, group: int) -> int:
     return 16 if rows <= 16 else 32 if rows <= 32 else 64 if rows <= 64 else 128
 
 
+def _tiles(max_query_len: int, group: int) -> tuple[int, int, int]:
+    """`(BLOCK_M, BLOCK_N, num_warps)` for the batch's longest query."""
+    block_m = _block_m(max_query_len, group)
+    if envs.VLLM_BATCH_INVARIANT:
+        # The key tile sets a row's softmax order (row tiles and warps do
+        # not): keep decode's 128 keys whatever query shares the launch.
+        block_m = min(block_m, 64)
+        return block_m, 128, 8 if block_m == 64 else 4
+    block_n = 64 if block_m >= 128 else 128 if block_m <= 32 else 64
+    return block_m, block_n, 8 if block_m >= 128 else 4
+
+
 def rel_attention(
     q: torch.Tensor,
     key_cache: torch.Tensor,
@@ -293,7 +306,7 @@ def rel_attention(
     sinks = q if sinks is None else sinks
     if lse is None:
         lse = out
-    block_m = _block_m(max_query_len, group)
+    block_m, block_n, num_warps = _tiles(max_query_len, group)
     tokens_per_tile = block_m // group
     num_reqs = cache_seqlens.shape[0]
     grid = (
@@ -343,7 +356,7 @@ def rel_attention(
         DRAFT=draft,
         MODE=mode,
         BLOCK_M=block_m,
-        BLOCK_N=64 if block_m >= 128 else 128 if block_m <= 32 else 64,
-        num_warps=8 if block_m >= 128 else 4,
+        BLOCK_N=block_n,
+        num_warps=num_warps,
         num_stages=2,
     )

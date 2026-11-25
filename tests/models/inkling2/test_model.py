@@ -186,16 +186,33 @@ def _redraw_loop_controllers(model: torch.nn.Module) -> None:
             gain_forget.normal_(std=gain_forget.shape[-1] ** -0.5, generator=generator)
 
 
+def _redraw_attention(model: torch.nn.Module) -> None:
+    """Unit-scale attention inputs, projections and query scales, and logits
+    (dummy weights give every key about the same score and every token about
+    the same logit, which hides the order of the softmax over keys)."""
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    for name, param in model.named_parameters():
+        if name.endswith(("attn_norm.weight", "attn.q_scale", "model.norm.weight")):
+            param.fill_(1.0)
+        elif name.endswith(("attn.qkvr.weight", "lm_head.weight")):
+            param.normal_(std=param.shape[-1] ** -0.5, generator=generator)
+
+
 @pytest.mark.skipif(
     not current_platform.is_device_capability(80),
     reason="Inkling2 batch invariance is validated on A100",
 )
-def test_tiny_looped_model_batch_invariant(tmp_path, monkeypatch, enable_pickle):
+@pytest.mark.parametrize("prefix_caching", [False, True])
+def test_tiny_looped_model_batch_invariant(
+    tmp_path, monkeypatch, enable_pickle, prefix_caching
+):
     """With VLLM_BATCH_INVARIANT=1 a request gets the same tokens and logprob
     bits alone and next to other requests, through decode-only steps and
     steps shared with prefill chunks of thousands of tokens (the attention,
     q/r prologue, AttnRes and GEMM kernels otherwise pick their split or
-    tiling from the batch)."""
+    tiling from the batch). With prefix caching, a request whose prompt is
+    cached prefills only its last few tokens, and its attention must still
+    sum the keys in the order of a full prefill."""
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
     (tmp_path / "config.json").write_text(json.dumps(TINY_LOOP_CONFIG))
@@ -208,10 +225,11 @@ def test_tiny_looped_model_batch_invariant(tmp_path, monkeypatch, enable_pickle)
         max_num_batched_tokens=4096,
         max_model_len=2048,
         max_num_seqs=16,
-        enable_prefix_caching=False,
+        enable_prefix_caching=prefix_caching,
         limit_mm_per_prompt={"image": 0},
     )
     llm.apply_model(_redraw_loop_controllers)
+    llm.apply_model(_redraw_attention)
     targets = [[7, 8, 9], list(range(2, 202)), [5] * 40, list(range(300, 900))]
     fillers = [[2 + (7 * j + i) % 990 for j in range(1500)] for i in range(4)]
     params = SamplingParams(
@@ -229,6 +247,12 @@ def test_tiny_looped_model_batch_invariant(tmp_path, monkeypatch, enable_pickle)
     batched = llm.generate([{"prompt_token_ids": p} for p in targets + fillers], params)
     for i, target in enumerate(alone):
         assert steps(batched[i]) == target, f"target {i} changed with the batch"
+    if prefix_caching:
+        again = [llm.generate([{"prompt_token_ids": p}], params)[0] for p in targets]
+        # The 200-token target reuses 192 cached tokens and prefills 8.
+        assert again[1].num_cached_tokens == 192
+        for i, target in enumerate(alone):
+            assert steps(again[i]) == target, f"target {i} changed with a cache hit"
 
 
 def test_loop_serving_options_validation(tmp_path):
