@@ -92,6 +92,50 @@ def test_markov_head_fold_and_softcapped_logits(dist_init, default_vllm_config):
     assert torch.equal(latent, torch.tanh(out_raw))
 
 
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(80),
+    reason="the e4m3 draft head is SM8x only",
+)
+@pytest.mark.parametrize("rows", [1, 7, 56])
+def test_fp8_draft_head_matches_dequantized_head(rows, monkeypatch):
+    """`VLLM_INKLING2_FP8_DECODE_WEIGHTS=draft` base logits are the GEMM
+    with the per-row e4m3 dequantized head (fp32 accumulate), and the flag
+    is off by default."""
+    from vllm import envs
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        marlin_make_workspace_new,
+    )
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+        apply_fp8_marlin_linear,
+    )
+    from vllm.models.inkling2.nvidia.dspark import (
+        _use_fp8_draft_head,
+        quantize_fp8_head,
+    )
+
+    g = torch.Generator().manual_seed(7)
+    vocab, hidden = 20480, 2304
+    weight = (torch.randn(vocab, hidden, generator=g) * 0.02).bfloat16().to(DEVICE)
+    x = torch.randn(rows, hidden, generator=g).bfloat16().to(DEVICE)
+    monkeypatch.delenv("VLLM_INKLING2_FP8_DECODE_WEIGHTS", raising=False)
+    assert envs.VLLM_INKLING2_FP8_DECODE_WEIGHTS == "none"
+    assert not _use_fp8_draft_head(weight)
+    monkeypatch.setenv("VLLM_INKLING2_FP8_DECODE_WEIGHTS", "draft")
+    assert _use_fp8_draft_head(weight)
+
+    qweight, scales = quantize_fp8_head(weight)
+    workspace = marlin_make_workspace_new(weight.device)
+    logits = apply_fp8_marlin_linear(x, qweight, scales, workspace, vocab, hidden, None)
+
+    row_scale = weight.abs().amax(1, keepdim=True) / 448
+    dequant = (weight / row_scale).to(torch.float8_e4m3fn).float() * row_scale.float()
+    expected = x.float() @ dequant.T
+    torch.testing.assert_close(logits.float(), expected, atol=2e-2, rtol=2e-2)
+    # e4m3 keeps 3 mantissa bits: logits stay within a few percent of bf16.
+    bf16 = x.float() @ weight.float().T
+    assert (logits.float() - bf16).abs().max() < 0.1 * bf16.abs().max()
+
+
 @pytest.mark.parametrize("is_local", [True, False])
 @pytest.mark.parametrize("num_splits", [1, 3])
 def test_block_attention_anchored_window(is_local, num_splits):

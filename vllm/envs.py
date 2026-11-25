@@ -225,6 +225,7 @@ if TYPE_CHECKING:
     ] = "relax"
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
+    VLLM_INKLING2_FP8_DECODE_WEIGHTS: Literal["none", "draft"] = "none"
     VLLM_STEP5_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
@@ -1748,6 +1749,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Under DP, TRT-LLM block-FP8/MXFP8 monolithic MoE then takes vLLM's
     # routing instead of routing from logits; 0 restores the kernel's routing.
     "VLLM_MOE_SKIP_PADDING": lambda: bool(int(os.getenv("VLLM_MOE_SKIP_PADDING", "1"))),
+    # Inkling 2 with DSpark on SM8x: "draft" gives the drafter's base logits a
+    # weight-only e4m3 copy of the LM head (per-row scales, Marlin W8A16), so
+    # they read half the bytes; the target keeps the bf16 head, so accepted
+    # tokens still come from it. Costs vocab x hidden bytes of GPU memory.
+    "VLLM_INKLING2_FP8_DECODE_WEIGHTS": env_with_choices(
+        "VLLM_INKLING2_FP8_DECODE_WEIGHTS", "none", ["none", "draft"]
+    ),
     # Step5 SP dense/shared MLPs: opt into TP-sharded weights with AG/RS
     # instead of replicated weights and local-token computation.
     "VLLM_STEP5_SHARD_SP_SHARED_EXPERT": lambda: bool(

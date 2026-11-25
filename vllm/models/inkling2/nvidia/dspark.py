@@ -11,6 +11,7 @@ from typing import cast
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
@@ -28,6 +29,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
@@ -439,6 +441,51 @@ class Inkling2DSparkDecoder(nn.Module):
         return all_reduce_add_rmsnorm(x, residual, self.norm)
 
 
+# Rows up to which the e4m3 head's Marlin GEMM beats the bf16 one on A100
+# (1.82x at 7 rows, 1.19x at 64, 0.77x at 84): larger draft batches keep bf16.
+_FP8_HEAD_MAX_ROWS = 64
+
+
+def _use_fp8_draft_head(weight: torch.Tensor) -> bool:
+    """`VLLM_INKLING2_FP8_DECODE_WEIGHTS=draft` on SM8x, for Marlin-sized
+    heads."""
+    n, k = weight.shape
+    return (
+        envs.VLLM_INKLING2_FP8_DECODE_WEIGHTS == "draft"
+        and current_platform.is_device_capability_family(80)
+        and n % 64 == 0
+        and k % 128 == 0
+    )
+
+
+@torch.no_grad()
+def quantize_fp8_head(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Marlin weight and scales of a weight-only e4m3 copy of the bf16
+    `(N, K)` `weight`, one scale per row (amax / 448), converted in row
+    chunks to bound the temporaries."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        marlin_permute_scales,
+    )
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+        fp8_fused_exponent_bias_into_scales,
+        pack_fp8_to_int32,
+    )
+
+    n, k = weight.shape
+    scales = weight.abs().amax(1, keepdim=True) / 448
+    fp8 = torch.empty((n, k), dtype=torch.float8_e4m3fn, device=weight.device)
+    for rows in torch.arange(n, device="cpu").split(16384):
+        sl = slice(int(rows[0]), int(rows[-1]) + 1)
+        fp8[sl] = (weight[sl] / scales[sl]).to(torch.float8_e4m3fn)
+    packed = pack_fp8_to_int32(fp8, False).T.contiguous()
+    del fp8
+    qweight = ops.gptq_marlin_repack(b_q_weight=packed, size_k=k, size_n=n, num_bits=8)
+    del packed
+    marlin_scales = marlin_permute_scales(s=scales.T, size_k=k, size_n=n, group_size=-1)
+    return qweight, fp8_fused_exponent_bias_into_scales(marlin_scales)
+
+
 class Inkling2DSparkModel(nn.Module):
     """DSpark draft for Inkling2; plugged in by `Inkling2DSparkSpeculator`."""
 
@@ -481,6 +528,8 @@ class Inkling2DSparkModel(nn.Module):
             config, vllm_config.model_config.max_model_len, f"{prefix}model"
         )
         self.lm_head: nn.Module | None = None
+        # Marlin weight, scales and workspace of the e4m3 LM head copy.
+        self.fp8_head: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
     @torch.no_grad()
     def attach_target(self, target_model: nn.Module) -> None:
@@ -506,6 +555,26 @@ class Inkling2DSparkModel(nn.Module):
         self.model.fuse_alpha.copy_(
             torch.softmax(self.model.fuse_weight.float(), dim=-1)
         )
+        if _use_fp8_draft_head(self.lm_head.weight):
+            self._refresh_fp8_head()
+
+    def _refresh_fp8_head(self) -> None:
+        """Re-derive the e4m3 copy of the LM head the base logits read
+        (`VLLM_INKLING2_FP8_DECODE_WEIGHTS=draft`)."""
+        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+            marlin_make_workspace_new,
+        )
+
+        assert self.lm_head is not None
+        weight = self.lm_head.weight
+        qweight, scales = quantize_fp8_head(weight)
+        if self.fp8_head is None:
+            workspace = marlin_make_workspace_new(weight.device)
+            self.fp8_head = (qweight, scales, workspace)
+        else:
+            self.fp8_head[0].copy_(qweight)
+            self.fp8_head[1].copy_(scales)
+        torch.accelerator.empty_cache()
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
@@ -542,8 +611,17 @@ class Inkling2DSparkModel(nn.Module):
         return self.model(input_ids, positions)
 
     def compute_base_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """TP-local bf16 base logits (bf16 GEMM, as the reference)."""
+        """TP-local bf16 base logits (bf16 GEMM, as the reference; with
+        `VLLM_INKLING2_FP8_DECODE_WEIGHTS=draft`, the e4m3 copy of the LM
+        head for up to `_FP8_HEAD_MAX_ROWS` rows)."""
         assert self.lm_head is not None
+        if self.fp8_head is not None and hidden_states.shape[0] <= _FP8_HEAD_MAX_ROWS:
+            from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (  # noqa: E501
+                apply_fp8_marlin_linear,
+            )
+
+            n, k = self.lm_head.weight.shape
+            return apply_fp8_marlin_linear(hidden_states, *self.fp8_head, n, k, None)
         return linear(hidden_states, self.lm_head.weight)
 
     def markov_step(
