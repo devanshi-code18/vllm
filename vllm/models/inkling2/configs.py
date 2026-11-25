@@ -215,6 +215,11 @@ class Inkling2ModelConfig(PreTrainedConfig):
             )
         return loops
 
+    def pass_min_loop_passes(self, pass_idx: int) -> int:
+        """The `min_loop_passes` of loop pass `pass_idx`'s KV caches: with
+        per-request counts, requests that stop earlier hold no blocks there."""
+        return pass_idx + 1 if self.loop_max_passes is not None else 1
+
     @property
     def num_layer_visits(self) -> int:
         """Decoder layers run per token: each loop pass runs the core again."""

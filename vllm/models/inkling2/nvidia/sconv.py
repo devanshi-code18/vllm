@@ -8,18 +8,25 @@ are TP-sharded with the KV heads; the attn-/mlp-output streams are replicated
 full-width on every rank (`replicate_hidden=True`).
 """
 
+import copy
+from dataclasses import replace
 from typing import cast
 
 import torch
 from torch import nn
 
+from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.inkling.nvidia.sconv_swa_attn import (
     InklingConvState,
+    InklingSconvBackend,
     InklingSconvMetadata,
+    InklingSconvMetadataBuilder,
 )
+from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.kv_cache_interface import KVCacheLayerConfig
 
 from .ops.allreduce import Inkling2AllReduceWorkspace, all_reduce_conv_mix
 from .ops.conv_mix import conv_mix as fused_conv_mix
@@ -29,6 +36,47 @@ from .ops.sconv import short_conv
 from .ops.seq_parallel import SeqParallel
 
 K_STREAM, V_STREAM, ATTN_STREAM, MLP_STREAM = range(4)
+
+
+class Inkling2SconvMetadataBuilder(InklingSconvMetadataBuilder):
+    """Per-pass groups' metadata differ only in block tables and slots."""
+
+    supports_update_block_table = True
+
+    def update_block_table(
+        self,
+        metadata: InklingSconvMetadata,
+        blk_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> InklingSconvMetadata:
+        new_metadata = copy.copy(metadata)
+        new_metadata.block_table = blk_table
+        new_metadata.slot_mapping = slot_mapping[: metadata.slot_mapping.shape[0]]
+        return new_metadata
+
+
+class Inkling2SconvBackend(InklingSconvBackend):
+    """The conv-state cache's metadata; it runs no kernel."""
+
+    @staticmethod
+    def get_builder_cls() -> type[Inkling2SconvMetadataBuilder]:
+        return Inkling2SconvMetadataBuilder
+
+
+class Inkling2ConvState(InklingConvState):
+    """`InklingConvState` whose caches belong to the loop passes
+    `min_loop_passes` and up (see `KVCacheLayerConfig`)."""
+
+    def __init__(self, *, min_loop_passes: int = 1, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.min_loop_passes = min_loop_passes
+
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        return Inkling2SconvBackend
+
+    def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
+        config = super().get_kv_cache_config(vllm_config)
+        return replace(config, min_loop_passes=self.min_loop_passes)
 
 
 def conv_metadata(owner: InklingConvState) -> InklingSconvMetadata | None:

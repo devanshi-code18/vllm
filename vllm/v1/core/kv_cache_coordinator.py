@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from typing import Any
 
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
@@ -143,6 +144,10 @@ class KVCacheCoordinator(ABC):
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
 
+    def active_group_ids(self, request_id: str) -> Sequence[int]:
+        """The groups that hold the request's blocks (all of them here)."""
+        return range(len(self.single_type_managers))
+
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
@@ -188,7 +193,8 @@ class KVCacheCoordinator(ABC):
         num_blocks_to_allocate = 0
         if self.retention_interval != 0:
             prefill_end = 0
-        for i, manager in enumerate(self.single_type_managers):
+        for i in self.active_group_ids(request_id):
+            manager = self.single_type_managers[i]
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
@@ -257,15 +263,17 @@ class KVCacheCoordinator(ABC):
         # cache-hit blocks, then allocate external blocks for every group. This
         # ensures an earlier group's external `get_new_blocks` cannot evict a
         # later group's not-yet-touched cache-hit blocks.
-        for i, manager in enumerate(self.single_type_managers):
-            manager.add_local_computed_blocks(
+        group_ids = self.active_group_ids(request_id)
+        for i in group_ids:
+            self.single_type_managers[i].add_local_computed_blocks(
                 request_id,
                 new_computed_blocks[i],
                 num_local_computed_tokens,
                 num_external_computed_tokens,
             )
         if num_external_computed_tokens > 0:
-            for i, manager in enumerate(self.single_type_managers):
+            for i in group_ids:
+                manager = self.single_type_managers[i]
                 manager.allocate_external_computed_blocks(
                     request_id,
                     num_local_computed_tokens,
@@ -328,7 +336,8 @@ class KVCacheCoordinator(ABC):
             num_hash_lookahead_tokens=self.block_pool.num_hash_lookahead_tokens,
         )
         num_cacheable_tokens = self.get_num_cacheable_tokens(num_computed_tokens)
-        for manager in self.single_type_managers:
+        for i in self.active_group_ids(request.request_id):
+            manager = self.single_type_managers[i]
             if not manager.enable_caching:
                 continue
             manager.cache_blocks(
@@ -369,7 +378,8 @@ class KVCacheCoordinator(ABC):
             request: The request.
 
         """
-        for manager in self.single_type_managers:
+        for i in self.active_group_ids(request.request_id):
+            manager = self.single_type_managers[i]
             manager.cache_blocks_on_free(request)
             manager.free(request.request_id)
 
@@ -388,7 +398,8 @@ class KVCacheCoordinator(ABC):
 
         """
         blocks: list[KVCacheBlock] = []
-        for manager in self.single_type_managers:
+        for i in self.active_group_ids(request.request_id):
+            manager = self.single_type_managers[i]
             manager.cache_blocks_on_free(request)
             blocks.extend(manager.pop_blocks_for_free(request.request_id))
         return blocks
@@ -411,8 +422,8 @@ class KVCacheCoordinator(ABC):
                 manager types ignore it.
 
         """
-        for manager in self.single_type_managers:
-            manager.remove_skipped_blocks(
+        for i in self.active_group_ids(request_id):
+            self.single_type_managers[i].remove_skipped_blocks(
                 request_id, processed_computed_tokens, num_prompt_tokens
             )
 
@@ -429,6 +440,7 @@ class KVCacheCoordinator(ABC):
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
         num_request_tokens: int | None = None,
+        group_ids: Sequence[int] | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         """Returns the per-group hit blocks, the hit length, and the number of
         `num_uncached_common_prefix_tokens` (a shared prefix that a
@@ -437,7 +449,8 @@ class KVCacheCoordinator(ABC):
         `num_request_tokens` is the request length in the coordinates of
         `block_hashes`. `None` means `max_cache_hit_length + 1`, which is
         at most the request length: an underestimate only asks for more blocks,
-        while an overestimate could skip blocks a draft reads.
+        while an overestimate could skip blocks a draft reads. `group_ids`
+        limits the lookup to the request's groups (`active_group_ids`).
         """
         pass
 
@@ -485,6 +498,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
         num_request_tokens: int | None = None,
+        group_ids: Sequence[int] | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         blocks: tuple[list[KVCacheBlock], ...] = tuple(
             [] for _ in range(self.num_single_type_manager)
@@ -541,6 +555,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
         num_request_tokens: int | None = None,
+        group_ids: Sequence[int] | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         hit_blocks, hit_length = self.single_type_managers[0].find_longest_cache_hit(
             block_hashes=block_hashes,
@@ -692,6 +707,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
         num_request_tokens: int | None = None,
+        group_ids: Sequence[int] | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         """Find the longest cache hit using an iterative fixed-point algorithm.
 
@@ -704,6 +720,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             block_hashes: The block hashes of the request.
             max_cache_hit_length: The maximum length of the cache hit.
             num_request_tokens: The request length; see the base class.
+            group_ids: The groups the hit must cover; see the base class.
 
         Returns:
             A tuple containing:
@@ -720,18 +737,27 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         longest_hit_length = 0
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
 
+        attention_groups = self.attention_groups
+        if group_ids is not None and len(group_ids) < num_groups:
+            active = set(group_ids)
+            attention_groups = [
+                g._replace(group_ids=ids)
+                for g in attention_groups
+                if (ids := [i for i in g.group_ids if i in active])
+            ]
+
         # Simple hybrid (1 full attn + 1 other): one iteration suffices.
         # Full attn is always first if it exists.
-        is_simple_hybrid = len(self.attention_groups) == 2 and issubclass(
-            self.attention_groups[0].manager_cls, FullAttentionManager
+        is_simple_hybrid = len(attention_groups) == 2 and issubclass(
+            attention_groups[0].manager_cls, FullAttentionManager
         )
 
         while True:
             curr_hit_length = hit_length
 
-            for manager_config, block_size, group_ids in self.attention_groups:
+            for manager_config, block_size, lookup_ids in attention_groups:
                 manager_cls = manager_config.manager_cls
-                first_group_id = group_ids[0]
+                first_group_id = lookup_ids[0]
                 cached_blocks = hit_blocks_by_group[first_group_id]
                 if (
                     issubclass(manager_cls, FullAttentionManager)
@@ -745,7 +771,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
                     block_hashes=block_hashes,
                     max_length=curr_hit_length,
-                    kv_cache_group_ids=group_ids,
+                    kv_cache_group_ids=lookup_ids,
                     block_pool=self.single_type_managers[first_group_id].block_pool,
                     block_size=block_size,
                     manager_config=manager_config,
@@ -756,7 +782,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     num_request_tokens=num_request_tokens,
                 )
                 curr_hit_length = _new_hit_length
-                for group_id, blocks in zip(group_ids, hit_blocks):
+                for group_id, blocks in zip(lookup_ids, hit_blocks):
                     hit_blocks_by_group[group_id] = blocks
 
                 longest_hit_length = max(longest_hit_length, curr_hit_length)
@@ -769,7 +795,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
         # Truncate every full-attention group (target and draft) blocks
         # to final hit_length.
-        for group in self.attention_groups:
+        for group in attention_groups:
             if not issubclass(group.manager_cls, FullAttentionManager):
                 continue
             manager = self.single_type_managers[group.group_ids[0]]
@@ -829,6 +855,78 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         return tuple(hit_blocks), tuple(hit_lengths)
 
 
+class LoopPassGroupsCoordinator(KVCacheCoordinator):
+    """Per-pass KV cache groups of a looped model with per-request pass counts
+    (`KVCacheGroup.min_loop_passes`): a request holds blocks only in the groups
+    of the passes it runs."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._group_min_loop_passes = tuple(
+            g.min_loop_passes for g in self.kv_cache_config.kv_cache_groups
+        )
+        self._group_ids_by_passes: dict[int, tuple[int, ...]] = {}
+        self.req_group_ids: dict[str, tuple[int, ...]] = {}
+
+    def group_ids_for_loop_passes(self, loop_passes: int) -> tuple[int, ...]:
+        """The groups a request running `loop_passes` loop passes uses."""
+        group_ids = self._group_ids_by_passes.get(loop_passes)
+        if group_ids is None:
+            group_ids = self._group_ids_by_passes[loop_passes] = tuple(
+                i for i, p in enumerate(self._group_min_loop_passes) if p <= loop_passes
+            )
+        return group_ids
+
+    def set_request_loop_passes(self, request_id: str, loop_passes: int) -> None:
+        """Leave the groups of passes after `loop_passes` without blocks for
+        the request until it is freed."""
+        self.req_group_ids[request_id] = self.group_ids_for_loop_passes(loop_passes)
+
+    def active_group_ids(self, request_id: str) -> Sequence[int]:
+        group_ids = self.req_group_ids.get(request_id)
+        if group_ids is None:
+            return super().active_group_ids(request_id)
+        return group_ids
+
+    def allocate_new_blocks(
+        self,
+        request_id: str,
+        num_tokens: int,
+        num_tokens_main_model: int,
+        num_encoder_tokens: int = 0,
+    ) -> tuple[list[KVCacheBlock], ...]:
+        new_blocks: list[list[KVCacheBlock]] = [[] for _ in self.single_type_managers]
+        for i in self.active_group_ids(request_id):
+            manager = self.single_type_managers[i]
+            new_blocks[i] = manager.allocate_new_blocks(
+                request_id,
+                num_encoder_tokens
+                if isinstance(manager, CrossAttentionManager)
+                else num_tokens,
+                num_tokens_main_model,
+            )
+        return tuple(new_blocks)
+
+    def free(self, request: Request) -> None:
+        super().free(request)
+        self.req_group_ids.pop(request.request_id, None)
+
+    def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:
+        blocks = super().pop_blocks_for_free(request)
+        self.req_group_ids.pop(request.request_id, None)
+        return blocks
+
+
+class LoopPassKVCacheCoordinator(LoopPassGroupsCoordinator, HybridKVCacheCoordinator):
+    pass
+
+
+class LoopPassKVCacheCoordinatorNoPrefixCache(
+    LoopPassGroupsCoordinator, KVCacheCoordinatorNoPrefixCache
+):
+    pass
+
+
 def get_kv_cache_coordinator(
     kv_cache_config: KVCacheConfig,
     max_model_len: int,
@@ -842,8 +940,16 @@ def get_kv_cache_coordinator(
     num_hash_lookahead_tokens: int = 0,
     allow_partial_hash_hits: bool = True,
 ) -> KVCacheCoordinator:
+    loop_pass_groups = any(
+        g.min_loop_passes > 1 for g in kv_cache_config.kv_cache_groups
+    )
     if not enable_caching:
-        return KVCacheCoordinatorNoPrefixCache(
+        no_cache_cls = (
+            LoopPassKVCacheCoordinatorNoPrefixCache
+            if loop_pass_groups
+            else KVCacheCoordinatorNoPrefixCache
+        )
+        return no_cache_cls(
             kv_cache_config,
             max_model_len,
             max_in_flight_tokens,
@@ -867,7 +973,10 @@ def get_kv_cache_coordinator(
             metrics_collector=metrics_collector,
             num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         )
-    return HybridKVCacheCoordinator(
+    hybrid_cls = (
+        LoopPassKVCacheCoordinator if loop_pass_groups else HybridKVCacheCoordinator
+    )
+    return hybrid_cls(
         kv_cache_config,
         max_model_len,
         max_in_flight_tokens,

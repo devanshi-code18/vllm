@@ -140,11 +140,16 @@ def _check_enough_kv_cache_memory(
 
 def can_share_block_table(layer_configs: dict[str, KVCacheLayerConfig]) -> bool:
     """Whether the layers can form one KV cache group: one manager policy, block
-    size and DCP sharding, with layouts the manager accepts side by side."""
+    size, DCP sharding and loop pass, with layouts the manager accepts side by
+    side."""
     first = next(iter(layer_configs.values()))
     specs = [lc.spec for lc in layer_configs.values()]
     return (
-        all(lc.manager_config == first.manager_config for lc in layer_configs.values())
+        all(
+            lc.manager_config == first.manager_config
+            and lc.min_loop_passes == first.min_loop_passes
+            for lc in layer_configs.values()
+        )
         and len({(spec.block_size, spec.dcp_sharded) for spec in specs}) == 1
         and first.manager_cls.can_share_block_table(specs)
     )

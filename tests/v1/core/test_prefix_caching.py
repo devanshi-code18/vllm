@@ -2344,6 +2344,68 @@ def make_kv_cache_config_hybrid_model(
     )
 
 
+def test_per_pass_groups_hold_only_the_request_passes():
+    """A looped model with per-request pass counts: a request allocates, caches,
+    looks up and frees only the KV cache groups of the passes it runs. A 1-pass
+    request holds half the blocks of a 2-pass one, the pass-2 groups do not
+    limit its prefix hits, and freeing returns every block."""
+    block_size = 16
+    full = AttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    swa = _swa_layer(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=2 * block_size,
+    )
+    config = KVCacheConfig(
+        num_blocks=40,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            new_kv_cache_group([f"{kind}.pass{p}"], layer, min_loop_passes=p)
+            for p in (1, 2)
+            for kind, layer in (("full", full), ("swa", swa))
+        ],
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        request_loop_passes=lambda r: r.sampling_params.extra_args["loops"],
+    )
+    num_free = manager.block_pool.get_num_free_blocks()
+    prompt = [i for i in range(3) for _ in range(block_size)] + [3] * 7
+
+    def request(request_id: str, loops: int) -> Request:
+        params = SamplingParams(max_tokens=17, extra_args={"loops": loops})
+        return make_request(
+            request_id, prompt, block_size, sha256, sampling_params=params
+        )
+
+    one_pass, two_pass = request("0", 1), request("1", 2)
+    blocks = manager.allocate_slots(one_pass, len(prompt))
+    assert blocks is not None
+    assert [len(ids) for ids in blocks.get_block_ids()] == [4, 4, 0, 0]
+    computed, num_computed, _ = manager.get_computed_blocks(two_pass)
+    assert num_computed == 0, "the pass-2 groups hold nothing to hit"
+    blocks = manager.allocate_slots(two_pass, len(prompt), 0, computed)
+    assert blocks is not None
+    assert [len(ids) for ids in blocks.get_block_ids()] == [4, 4, 4, 4]
+    assert num_free - manager.block_pool.get_num_free_blocks() == 8 + 16
+
+    hit = request("2", 1)
+    computed, num_computed, _ = manager.get_computed_blocks(hit)
+    assert num_computed == 3 * block_size
+    assert [len(b) for b in computed.blocks] == [3, 3, 0, 0]
+
+    manager.free(one_pass)
+    manager.free(two_pass)
+    assert manager.block_pool.get_num_free_blocks() == num_free
+
+
 def make_kv_cache_config_three_types(
     block_size: int, num_blocks: int, third_spec_type: str = "mamba"
 ) -> KVCacheConfig:

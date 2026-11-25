@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
 import mmap
+from collections import Counter
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -989,6 +990,33 @@ def test_layers_group_by_manager_policy_not_layout():
     assert groups[0].layer_names == ["narrow", "wide"]
     assert groups[0].kv_cache_specs == {"narrow": spec, "wide": wide_spec}
     assert groups[0].page_size_bytes == spec.page_size_bytes + wide_spec.page_size_bytes
+
+
+def test_layers_group_by_loop_pass():
+    """A looped model's per-pass caches (`min_loop_passes`) never share a group
+    with another pass's, so a request running fewer passes can leave whole
+    groups unallocated. Inkling2-varloop shape at 3 passes: the first pass with
+    the prelude and coda holds twice the layers of a later pass; groups stay one
+    size, so a request's blocks scale with its passes."""
+    spec = new_kv_cache_spec()
+    full, swa = full_layer(spec), sliding_window_layer(spec, 128)
+    assert not can_share_block_table({"a": full, "b": replace(full, min_loop_passes=2)})
+    specs = {}
+    for passes in (1, 2, 3):
+        scale = 2 if passes == 1 else 1
+        for kind, layer, count in (("full", full, 2), ("swa", swa, 4)):
+            for i in range(count * scale):
+                specs[f"{kind}.pass{passes}.{i}"] = replace(
+                    layer, min_loop_passes=passes
+                )
+
+    groups = get_kv_cache_groups(_grouping_config(), specs)
+
+    assert {len(g.layer_names) for g in groups} == {2}
+    for g in groups:
+        assert {n.split(".")[1] for n in g.layer_names} == {f"pass{g.min_loop_passes}"}
+    per_pass = Counter(g.min_loop_passes for g in groups)
+    assert per_pass == {1: 6, 2: 3, 3: 3}
 
 
 def test_mamba_can_share_block_table_requires_one_page_size():

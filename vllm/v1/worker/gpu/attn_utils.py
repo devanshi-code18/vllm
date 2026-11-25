@@ -508,8 +508,13 @@ def build_attn_metadata(
     # Mamba groups with the same spec and builder differ only in their state
     # indices, so later groups re-gather those from the first group's metadata.
     # Also at capture, so FULL graphs share the batch-level buffers.
-    cached_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
+    cached_metadata: dict[tuple, Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+    # So do a looped model's per-pass groups of one kind (same spec, policy
+    # and builder; see `KVCacheGroup.min_loop_passes`).
+    reuse_pass_groups = any(
+        g.min_loop_passes > 1 for g in kv_cache_config.kv_cache_groups
+    )
     for i in range(num_kv_cache_groups):
         groups = groups_with_metadata_builders(attn_groups[i])
         if not groups:
@@ -562,11 +567,16 @@ def build_attn_metadata(
 
         for attn_group in groups:
             attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
-            reuse_key = None
-            if attn_metadata_builder.supports_update_block_table and isinstance(
-                attn_group.kv_cache_spec, MambaSpec
-            ):
-                reuse_key = (attn_group.kv_cache_spec, type(attn_metadata_builder))
+            reuse_key: tuple | None = None
+            if attn_metadata_builder.supports_update_block_table:
+                if isinstance(attn_group.kv_cache_spec, MambaSpec):
+                    reuse_key = (attn_group.kv_cache_spec, type(attn_metadata_builder))
+                elif reuse_pass_groups:
+                    reuse_key = (
+                        attn_group.kv_cache_spec,
+                        type(attn_metadata_builder),
+                        kv_cache_config.kv_cache_groups[i].manager_config,
+                    )
             if reuse_key in cached_metadata:
                 metadata = attn_metadata_builder.update_block_table(
                     cached_metadata[reuse_key], block_table, slot_mapping

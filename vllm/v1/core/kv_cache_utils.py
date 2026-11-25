@@ -1153,10 +1153,17 @@ def get_max_concurrency_for_kv_cache_config(
     the per-request total is the sum over groups.
 
     Host groups use a separate pool; the smaller concurrency limit applies.
+    Groups of loop passes beyond the model's default pass count are not counted
+    (see `KVCacheGroup.min_loop_passes`).
     """
     num_blocks_per_request = 0
     host_blocks_per_request = 0
-    for group in kv_cache_config.kv_cache_groups:
+    groups = kv_cache_config.kv_cache_groups
+    if any(group.min_loop_passes > 1 for group in groups):
+        text_config = vllm_config.model_config.hf_text_config
+        default_passes = text_config.default_loop_passes
+        groups = [g for g in groups if g.min_loop_passes <= default_passes]
+    for group in groups:
         required = group.max_allocated_blocks_per_request(vllm_config)
         if group.host_resident:
             host_blocks_per_request += required

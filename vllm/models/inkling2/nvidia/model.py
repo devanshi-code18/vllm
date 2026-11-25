@@ -42,7 +42,6 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     _merge_multimodal_embeddings,
 )
-from vllm.models.inkling.nvidia.sconv_swa_attn import InklingConvState
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.encoder_cudagraph_defs import (
@@ -74,7 +73,13 @@ from .ops.attn_res import attn_res
 from .ops.ll_gemm_sm120 import sm12x_bf16_ll_gemm, use_sm12x_bf16_ll_gemm
 from .ops.norm import rms_norm
 from .ops.seq_parallel import SeqParallel
-from .sconv import ATTN_STREAM, MLP_STREAM, Inkling2ShortConv, conv_metadata
+from .sconv import (
+    ATTN_STREAM,
+    MLP_STREAM,
+    Inkling2ConvState,
+    Inkling2ShortConv,
+    conv_metadata,
+)
 from .vision import Inkling2VisionEncoder, VisionMetadata
 
 
@@ -180,13 +185,14 @@ class Inkling2DecoderLayer(nn.Module):
             else config.num_key_value_heads
         )
         self.conv_states = tuple(
-            InklingConvState(
+            Inkling2ConvState(
                 num_kv_heads=num_kv_heads,
                 head_dim=config.swa_head_dim if self.is_local else config.head_dim,
                 hidden_size=config.hidden_size,
                 kernel_size=config.sconv_kernel_size,
                 prefix=f"{prefix}.conv_state" + (f".pass{p}" if p else ""),
                 replicate_hidden=True,
+                min_loop_passes=config.pass_min_loop_passes(p),
             )
             for p in range(num_passes)
         )

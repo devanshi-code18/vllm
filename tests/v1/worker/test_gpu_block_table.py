@@ -369,6 +369,38 @@ def test_dummy_request_slot_mapping_is_pad():
     assert dummy[0].tolist() == [PAD_SLOT_ID] * 3
 
 
+def test_group_without_blocks_slot_mapping_is_pad():
+    """A request with no blocks in a group (a looped model's pass it does not
+    run) gets PAD slots and a null block-table row there, not its row's stale
+    entries, which may name blocks another request now owns."""
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[4, 4],
+        max_num_reqs=1,
+        max_num_batched_tokens=16,
+        max_num_blocks_per_group=[4, 4],
+        device=device,
+    )
+    block_tables.append_block_ids(0, ([7, 8], [5, 6]), overwrite=True)
+    block_tables.apply_staged_writes()
+    # The row's next request runs only the first group's pass.
+    block_tables.append_block_ids(0, ([9], []), overwrite=True)
+    block_tables.apply_staged_writes()
+    slot_mappings = block_tables.compute_slot_mappings(
+        torch.tensor([0], dtype=torch.int32, device=device),
+        torch.tensor([0, 3], dtype=torch.int32, device=device),
+        torch.tensor([0, 1, 2], dtype=torch.int64, device=device),
+        num_tokens_padded=3,
+    )
+    assert slot_mappings[0].tolist() == [9 * 4, 9 * 4 + 1, 9 * 4 + 2]
+    assert slot_mappings[1].tolist() == [PAD_SLOT_ID] * 3
+    gathered = block_tables.gather_block_tables(
+        torch.tensor([0], dtype=torch.int32, device=device), num_reqs_padded=1
+    )
+    assert gathered[0][0, :1].tolist() == [9]
+    assert gathered[1][0].tolist() == [0] * 4
+
+
 def test_gather_block_tables_nulls_blocks_below_sliding_window():
     """Entries wholly below the window of a request's first scheduled token
     may point at blocks the sliding-window manager already freed and reused;

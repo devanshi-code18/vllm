@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from tests.models.utils import TokensTextLogprobs, check_logprobs_close
-from vllm import LLM, SamplingParams
+from vllm import LLM, RequestOutput, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.exceptions import VLLMValidationError
 from vllm.models.inkling2.configs import (
@@ -258,10 +258,35 @@ def _redraw_loop_weights(model: torch.nn.Module) -> None:
     head.normal_(std=head.shape[-1] ** -0.5, generator=generator)
 
 
-def _greedy(
+def _fixed_routing(model: torch.nn.Module) -> None:
+    """Route every token to the same experts, by gate bias alone: a near tie in
+    a learned-looking router flips experts on rounding noise, and a flip moves
+    this random model's logits far more than any rounding."""
+    from vllm.models.inkling2.nvidia.moe import Inkling2MoE
+
+    for module in model.modules():
+        if isinstance(module, Inkling2MoE):
+            module.gate.weight.zero_()
+            bias = module.gate.bias
+            bias.copy_(-torch.arange(bias.numel(), dtype=bias.dtype))
+
+
+def _attention_output_weights(model: torch.nn.Module) -> None:
+    """Seeded redraw of the attention output projections: with dummy ones,
+    attention, and so the KV cache, barely moves this model's logits."""
+    from vllm.models.inkling2.nvidia.attention import Inkling2Attention
+
+    generator = torch.Generator(device="cuda").manual_seed(1)
+    for module in model.modules():
+        if isinstance(module, Inkling2Attention):
+            weight = module.wo_ud.weight
+            weight.normal_(std=weight.shape[-1] ** -0.5, generator=generator)
+
+
+def _greedy_outputs(
     llm: LLM, prompts: list[list[int]], loops: list[int | None]
-) -> list[TokensTextLogprobs]:
-    outputs = llm.generate(
+) -> list[RequestOutput]:
+    return llm.generate(
         [{"prompt_token_ids": p} for p in prompts],
         [
             SamplingParams(
@@ -275,7 +300,16 @@ def _greedy(
             for n in loops
         ],
     )
+
+
+def _logprobs(outputs: list[RequestOutput]) -> list[TokensTextLogprobs]:
     return [(list(o.outputs[0].token_ids), "", o.outputs[0].logprobs) for o in outputs]
+
+
+def _greedy(
+    llm: LLM, prompts: list[list[int]], loops: list[int | None]
+) -> list[TokensTextLogprobs]:
+    return _logprobs(_greedy_outputs(llm, prompts, loops))
 
 
 def test_tiny_looped_model_per_request_loops(tmp_path, enable_pickle):
@@ -321,6 +355,68 @@ def test_tiny_looped_model_per_request_loops(tmp_path, enable_pickle):
                     name_1=f"{b} passes",
                     warn_on_mismatch=False,
                 )
+
+
+def test_tiny_looped_model_per_pass_kv_groups(tmp_path, monkeypatch):
+    """With `loop_max_passes`, each pass's KV caches form their own groups and a
+    request allocates only the passes it runs; the batch still runs its largest
+    count, so a row's skipped passes must neither write (its block-table row
+    may still name an earlier request's blocks, here cached) nor change it.
+    Requests generate what a fixed-count engine that allocates every pass
+    generates for the same batches, cold and after a prefix-cache hit, also
+    after 1-pass rows ran next to 3-pass rows. The engine runs in process so
+    every request reaches the scheduler before its first step."""
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    (tmp_path / "config.json").write_text(json.dumps(TINY_LOOP_CONFIG))
+    prompts = [list(range(2 + 50 * i, 402 + 50 * i)) for i in range(4)]
+
+    def engine(text_overrides: dict[str, Any]) -> LLM:
+        llm = LLM(
+            model=str(tmp_path),
+            load_format="dummy",
+            skip_tokenizer_init=True,
+            tokenizer_mode="hf",
+            gpu_memory_utilization=0.10,
+            max_num_batched_tokens=512,
+            max_model_len=2048,
+            max_num_seqs=4,
+            enable_prefix_caching=True,
+            limit_mm_per_prompt={"image": 0},
+            hf_overrides={"text_config": text_overrides},
+        )
+        llm.apply_model(_redraw_loop_weights)
+        llm.apply_model(_fixed_routing)
+        llm.apply_model(_attention_output_weights)
+        return llm
+
+    def check(expected: list[TokensTextLogprobs], actual: list[TokensTextLogprobs]):
+        check_logprobs_close(
+            outputs_0_lst=expected, outputs_1_lst=actual, name_0="0", name_1="1"
+        )
+
+    llm = engine({"loop_max_passes": 3})
+    runs = {
+        n: [_greedy_outputs(llm, prompts, [n] * 4) for _ in range(2)] for n in (3, 1)
+    }
+    # The 1-pass rows run passes 2 and 3 for the 3-pass rows next to them,
+    # while their block-table rows for those passes still name the 3-pass
+    # requests' cached blocks, which the next call reads.
+    mixed = _greedy(llm, prompts, [1, 3, 1, 3])
+    after = _greedy(llm, prompts, [3] * 4)
+    del llm
+    cleanup_dist_env_and_memory()
+    assert all(o.num_cached_tokens for n in (3, 1) for o in runs[n][1])
+    cold, hit = ({n: _logprobs(runs[n][k]) for n in (3, 1)} for k in (0, 1))
+    check([hit[1][0], hit[3][1], hit[1][2], hit[3][3]], mixed)
+    check(hit[3], after)
+    with pytest.raises(AssertionError):
+        check(cold[1][:1], cold[3][:1])
+    for n in (3, 1):
+        fixed = engine({"loop_num_passes": n})
+        check(cold[n], _greedy(fixed, prompts, [None] * 4))
+        check(hit[n], _greedy(fixed, prompts, [None] * 4))
+        del fixed
+        cleanup_dist_env_and_memory()
 
 
 @pytest.mark.parametrize("looped", [False, True])

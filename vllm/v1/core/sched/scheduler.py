@@ -3,7 +3,7 @@
 import itertools
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from math import lcm
 from typing import Any
@@ -98,6 +98,19 @@ from vllm.v1.token_buffer import extend_from_slice
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _request_loop_passes_fn(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> Callable[[Request], int] | None:
+    """Each request's loop pass count, if the KV cache has per-pass groups
+    (`KVCacheGroup.min_loop_passes`); the model's text config parses it."""
+    if all(g.min_loop_passes == 1 for g in kv_cache_config.kv_cache_groups):
+        return None
+    request_loop_passes = vllm_config.model_config.hf_text_config.request_loop_passes
+    return lambda request: request_loop_passes(
+        request.sampling_params.extra_args if request.sampling_params else None
+    )
 
 
 class Scheduler(SchedulerInterface):
@@ -398,6 +411,7 @@ class Scheduler(SchedulerInterface):
             enable_mamba_shared_prefix_checkpoint=(
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
+            request_loop_passes=_request_loop_passes_fn(vllm_config, kv_cache_config),
         )
         # Mamba managers already account for their speculative state blocks.
         num_spec_decode_tokens = (

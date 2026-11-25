@@ -3,7 +3,7 @@
 """Inkling2 attention: relative-bias GQA with short-conv K/V, L2-clipped
 q/k/r, gated output and per-token attention sinks."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import cast
 
@@ -116,6 +116,7 @@ def _kv_cache_layer_config(
     num_kv_heads: int,
     head_dim: int,
     sliding_window: int | None,
+    min_loop_passes: int = 1,
 ) -> KVCacheLayerConfig:
     spec = AttentionSpec(
         block_size=vllm_config.cache_config.block_size,
@@ -126,8 +127,10 @@ def _kv_cache_layer_config(
         ),
     )
     if sliding_window is not None:
-        return SlidingWindowManager.layer_config(spec, sliding_window=sliding_window)
-    return FullAttentionManager.layer_config(spec)
+        config = SlidingWindowManager.layer_config(spec, sliding_window=sliding_window)
+    else:
+        config = FullAttentionManager.layer_config(spec)
+    return replace(config, min_loop_passes=min_loop_passes)
 
 
 class Inkling2AttentionPassCache(nn.Module, AttentionLayerBase):
@@ -141,9 +144,11 @@ class Inkling2AttentionPassCache(nn.Module, AttentionLayerBase):
         num_kv_heads: int,
         head_dim: int,
         sliding_window: int | None,
+        min_loop_passes: int = 1,
     ) -> None:
         super().__init__()
         self.prefix = prefix
+        self.min_loop_passes = min_loop_passes
         # Read by the metadata builders of the layer's attention group.
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -160,7 +165,11 @@ class Inkling2AttentionPassCache(nn.Module, AttentionLayerBase):
 
     def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
         return _kv_cache_layer_config(
-            vllm_config, self.num_kv_heads, self.head_dim, self.sliding_window
+            vllm_config,
+            self.num_kv_heads,
+            self.head_dim,
+            self.sliding_window,
+            self.min_loop_passes,
         )
 
 
@@ -273,6 +282,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 self.num_kv_heads,
                 self.head_dim,
                 self.sliding_window if is_local else None,
+                config.pass_min_loop_passes(p),
             )
             for p in range(1, 1 if config.loop_share_cache else len(self.conv_states))
         )

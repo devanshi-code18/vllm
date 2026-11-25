@@ -664,6 +664,10 @@ class KVCacheLayerConfig:
     is_draft: bool = field(default=False, kw_only=True, compare=False)
     """Whether a draft model owns this layer; excluded from equality so it never
     affects grouping."""
+    min_loop_passes: int = field(default=1, kw_only=True)
+    """Requests that run fewer loop passes leave this layer unused (the KV
+    cache of a later pass of a looped model with per-request pass counts);
+    layers group only with layers of the same value."""
 
     @property
     def manager_cls(self) -> type[SingleTypeKVCacheManager]:
@@ -700,6 +704,9 @@ class KVCacheGroup:
     # source group after a connector load.
     enable_kv_transfer: bool = True
     role: KVCacheGroupRole = KVCacheGroupRole.DEFAULT
+    # Requests running fewer loop passes hold no blocks in this group (see
+    # `KVCacheLayerConfig.min_loop_passes`).
+    min_loop_passes: int = 1
     # The whole group's distinct specs, set on a group projected onto a
     # pipeline stage.
     unprojected_specs: tuple[KVCacheSpec, ...] = field(default=(), compare=False)
@@ -716,8 +723,10 @@ class KVCacheGroup:
             lc.manager_config == first.manager_config
             and lc.spec.block_size == first.spec.block_size
             and lc.spec.dcp_sharded == first.spec.dcp_sharded
+            and lc.min_loop_passes == first.min_loop_passes
             for lc in layer_configs.values()
         ), "Layers in a KV cache group must share a manager policy and block size."
+        kwargs.setdefault("min_loop_passes", first.min_loop_passes)
         return cls(
             {name: lc.spec for name, lc in layer_configs.items()},
             first.manager_config,

@@ -264,6 +264,8 @@ class BlockTables:
             positions,
             self.block_table_ptrs,
             self.block_table_strides,
+            self.num_blocks.gpu,
+            self.num_blocks.gpu.stride(0),
             self.block_sizes_tensor,
             self.slot_mapping_enabled,
             self.dcp_sharded,
@@ -323,6 +325,13 @@ def _gather_block_tables_kernel(
     req_idx = tl.load(batch_idx_to_req_idx + batch_idx)
     group_num_blocks_ptr = num_blocks_ptr + group_id * num_blocks_stride
     num_blocks = tl.load(group_num_blocks_ptr + req_idx)
+    if num_blocks == 0:
+        # No blocks in this group (a loop pass the request skips): its reads
+        # see the null block, not the row's stale entries.
+        for i in tl.range(0, max_num_blocks, BLOCK_SIZE):
+            offset = i + tl.arange(0, BLOCK_SIZE)
+            tl.store(dst_row_ptr + offset, 0, mask=offset < max_num_blocks)
+        return
 
     src_block_table_ptr = _load_ptr(src_block_table_ptrs + group_id, tl.int32)
     src_row_ptr = src_block_table_ptr + req_idx * stride
@@ -356,6 +365,8 @@ def _compute_slot_mappings_kernel(
     pos,  # [num_tokens]
     block_table_ptrs,  # [num_kv_cache_groups]
     block_table_strides,  # [num_kv_cache_groups]
+    num_blocks_ptr,  # [num_kv_cache_groups, max_num_reqs]
+    num_blocks_stride,
     block_sizes,  # [num_kv_cache_groups]
     slot_mapping_enabled,  # [num_kv_cache_groups]
     dcp_sharded,  # [num_kv_cache_groups]
@@ -394,6 +405,13 @@ def _compute_slot_mappings_kernel(
     # idx_mapping == -1 marks a dummy (or CUDA-graph padding) request that owns
     # no blocks: never read its block-table row and emit PAD for its tokens.
     is_real_req = req_state_idx >= 0
+    # So does a request without blocks in this group (a loop pass it skips).
+    num_blocks = tl.load(
+        num_blocks_ptr + group_id * num_blocks_stride + req_state_idx,
+        mask=is_real_req,
+        other=0,
+    )
+    is_real_req = num_blocks > 0
     start_idx = tl.load(query_start_loc + batch_idx)
     end_idx = tl.load(query_start_loc + batch_idx + 1)
     for i in range(start_idx, end_idx, TRITON_BLOCK_SIZE):

@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
+    LoopPassGroupsCoordinator,
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -145,6 +146,7 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
+        request_loop_passes: Callable[[Request], int] | None = None,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -186,6 +188,13 @@ class KVCacheManager:
                 if isinstance(manager, MambaManager):
                     manager.shared_prefix_checkpoint = True
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+        # Looped models with per-request pass counts: a request allocates only
+        # the KV cache groups of the passes it runs.
+        self.loop_pass_coordinator: LoopPassGroupsCoordinator | None = None
+        if isinstance(self.coordinator, LoopPassGroupsCoordinator):
+            assert request_loop_passes is not None
+            self.loop_pass_coordinator = self.coordinator
+        self.request_loop_passes = request_loop_passes
         self.block_pool = self.coordinator.block_pool
         # Called when an allocation is short; returns True only if it can now proceed.
         self.reclaim_blocks: Callable[[str, int, int], bool] | None = None
@@ -261,6 +270,16 @@ class KVCacheManager:
         """Whether a local prefix cache lookup may be run for this request."""
         return self.enable_caching and request.prefix_cache_hit_limit != 0
 
+    def _lookup_group_ids(self, request: Request) -> tuple[int, ...] | None:
+        """The groups a prefix-cache hit of the request must cover (`None`:
+        all)."""
+        if self.loop_pass_coordinator is None:
+            return None
+        assert self.request_loop_passes is not None
+        return self.loop_pass_coordinator.group_ids_for_loop_passes(
+            self.request_loop_passes(request)
+        )
+
     def get_num_cached_tokens(self, request: Request) -> int:
         """How many of a request's tokens are already in the prefix cache.
 
@@ -279,7 +298,9 @@ class KVCacheManager:
             return 0
         # Mirrors `get_computed_blocks`: the last token is always recomputed.
         _, num_computed_tokens, _ = self.coordinator.find_longest_cache_hit(
-            request.block_hashes, request.num_tokens - 1
+            request.block_hashes,
+            request.num_tokens - 1,
+            group_ids=self._lookup_group_ids(request),
         )
         return num_computed_tokens
 
@@ -351,7 +372,10 @@ class KVCacheManager:
         max_cache_hit_length = request.get_max_cache_hit_length(max_cache_hit_length)
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length, request.num_tokens
+                request.block_hashes,
+                max_cache_hit_length,
+                request.num_tokens,
+                group_ids=self._lookup_group_ids(request),
             )
         )
 
@@ -536,6 +560,16 @@ class KVCacheManager:
             raise ValueError(
                 "num_new_tokens must be greater than 0 when there are no "
                 "computed tokens to adopt"
+            )
+
+        coordinator = self.loop_pass_coordinator
+        if (
+            coordinator is not None
+            and request.request_id not in coordinator.req_group_ids
+        ):
+            assert self.request_loop_passes is not None
+            coordinator.set_request_loop_passes(
+                request.request_id, self.request_loop_passes(request)
             )
 
         if new_computed_blocks is not None:
@@ -819,11 +853,14 @@ class KVCacheManager:
     def estimate_cached_tokens(self, request: Request) -> int:
         """Estimate the number of tokens cached by the request."""
         cached_tokens: int | None = None
-        for group, blocks in zip(
-            self.kv_cache_config.kv_cache_groups,
-            self.get_blocks(request.request_id).blocks,
+        group_ids = self.coordinator.active_group_ids(request.request_id)
+        for group_id, (group, blocks) in enumerate(
+            zip(
+                self.kv_cache_config.kv_cache_groups,
+                self.get_blocks(request.request_id).blocks,
+            )
         ):
-            if not group.prefix_cacheable:
+            if not group.prefix_cacheable or group_id not in group_ids:
                 continue
             if issubclass(group.manager_cls, CrossAttentionManager):
                 # Cross-attention groups are not prefix cached.
