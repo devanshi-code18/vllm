@@ -11,6 +11,7 @@ import torch
 
 from vllm import LLM, SamplingParams, envs
 from vllm.distributed import cleanup_dist_env_and_memory
+from vllm.exceptions import VLLMValidationError
 from vllm.models.inkling2.configs import (
     Inkling2DSparkConfig,
     Inkling2LoopMMConfig,
@@ -98,14 +99,16 @@ TINY_LOOP_CONFIG: dict[str, Any] = {
 }
 
 
-def _tiny_looped_llm(tmp_path, text_overrides: dict[str, Any]) -> LLM:
+def _tiny_looped_llm(
+    tmp_path, text_overrides: dict[str, Any], gpu_memory_utilization: float = 0.035
+) -> LLM:
     (tmp_path / "config.json").write_text(json.dumps(TINY_LOOP_CONFIG))
     return LLM(
         model=str(tmp_path),
         load_format="dummy",
         skip_tokenizer_init=True,
         tokenizer_mode="hf",
-        gpu_memory_utilization=0.035,
+        gpu_memory_utilization=gpu_memory_utilization,
         # These cache comparisons use at most 216 tokens in a single prefill.
         max_num_batched_tokens=256,
         max_model_len=2048,
@@ -284,6 +287,117 @@ def test_loop_serving_options_validation(tmp_path):
     config.text_config.loop_num_passes = 2
     with pytest.raises(ValueError, match="loop passes"):
         Inkling2DSparkConfig.from_target(config)
+
+
+def test_per_request_loop_options():
+    """Per-request pass counts need per-pass caches and a maximum at least the
+    default; a request's `loops` is checked against it, and requests with
+    other counts get their own prefix-cache salt."""
+    text = {**TINY_LOOP_CONFIG["text_config"]}
+    with pytest.raises(ValueError, match="loop_share_cache"):
+        Inkling2ModelConfig(**text, loop_max_passes=3, loop_share_cache=True)
+    with pytest.raises(ValueError, match="below the default"):
+        Inkling2ModelConfig(**text, loop_max_passes=2)
+    config = Inkling2LoopMMConfig(text_config={**text, "loop_max_passes": 5})
+    assert config.text_config.num_loop_passes == 5
+    assert config.text_config.default_loop_passes == 3
+    assert config.text_config.num_layer_visits == 12
+    assert config.request_cache_salt({"loops": 3}, "s") == "s"
+    assert config.request_cache_salt({}, None) is None
+    salts = {config.request_cache_salt({"loops": n}, None) for n in range(1, 6)}
+    assert len(salts) == 5
+    for bad in (0, 6, 2.0):
+        with pytest.raises(ValueError, match="loops must be"):
+            config.request_cache_salt({"loops": bad}, None)
+    fixed = Inkling2LoopMMConfig(text_config=text)
+    assert fixed.request_cache_salt({"loops": 3}, None) is None
+    with pytest.raises(ValueError, match="loop_max_passes"):
+        fixed.request_cache_salt({"loops": 2}, None)
+
+
+def _redraw_loop_weights(model: torch.nn.Module) -> None:
+    """Seeded redraw of the routers and loop message controllers (dummy
+    weights route every token alike and leave every pass alike)."""
+    from vllm.models.inkling2.nvidia.loop import Inkling2LoopDecoderLayer
+    from vllm.models.inkling2.nvidia.moe import Inkling2MoE
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    for module in model.modules():
+        if isinstance(module, Inkling2LoopDecoderLayer):
+            down, gain_forget = module.controller_down, module.controller_gain_forget
+            down.normal_(std=down.shape[-1] ** -0.5, generator=generator)
+            gain_forget.normal_(std=gain_forget.shape[-1] ** -0.5, generator=generator)
+        if isinstance(module, Inkling2MoE):
+            module.gate.weight.normal_(generator=generator)
+            module.gate.bias.zero_()
+
+
+def _greedy(
+    llm: LLM, prompts: list[list[int]], loops: list[int | None]
+) -> list[tuple[list[int], list[float]]]:
+    outputs = llm.generate(
+        [{"prompt_token_ids": p} for p in prompts],
+        [
+            SamplingParams(
+                max_tokens=16,
+                temperature=0,
+                logprobs=0,
+                ignore_eos=True,
+                detokenize=False,
+                extra_args=None if n is None else {"loops": n},
+            )
+            for n in loops
+        ],
+    )
+    results = []
+    for output in outputs:
+        out = output.outputs[0]
+        assert out.logprobs is not None
+        logprobs = []
+        for token, entry in zip(out.token_ids, out.logprobs):
+            assert entry is not None
+            logprobs.append(entry[token].logprob)
+        results.append((list(out.token_ids), logprobs))
+    return results
+
+
+def _assert_same_tokens(
+    actual: tuple[list[int], list[float]],
+    expected: tuple[list[int], list[float]],
+    atol: float,
+) -> None:
+    assert actual[0] == expected[0]
+    torch.testing.assert_close(actual[1], expected[1], atol=atol, rtol=0)
+
+
+def test_tiny_looped_model_per_request_loops(tmp_path, enable_pickle):
+    """With `loop_max_passes`, each request runs its own pass count: its row
+    of a mixed batch matches the same row when every row runs its count (same
+    batch shapes), and a server fixed at that count. Outside batch-invariant
+    mode neither is bitwise: a row moves by ~1e-6 with the other rows'
+    contents, and another engine can pick other kernels."""
+    prompts = [list(range(2 + 50 * i, 150 + 50 * i)) for i in range(3)]
+    loops = [1, 2, 3]
+    # CUDA graphs are captured once per pass count.
+    llm = _tiny_looped_llm(tmp_path, {"loop_max_passes": 3}, 0.08)
+    llm.apply_model(_redraw_loop_weights)
+    mixed = _greedy(llm, prompts, loops)
+    uniform = {n: _greedy(llm, prompts, [n] * len(prompts)) for n in loops}
+    with pytest.raises(VLLMValidationError, match="loops must be between 1 and 3"):
+        _greedy(llm, prompts[:1], [4])
+    del llm
+    cleanup_dist_env_and_memory()
+    for i, n in enumerate(loops):
+        _assert_same_tokens(mixed[i], uniform[n][i], atol=1e-5)
+    # The pass count changes the output.
+    assert uniform[1][0][1] != uniform[3][0][1]
+    for i, n in enumerate(loops):
+        fixed = _tiny_looped_llm(tmp_path, {"loop_num_passes": n})
+        fixed.apply_model(_redraw_loop_weights)
+        reference = _greedy(fixed, prompts, [None] * len(prompts))[i]
+        del fixed
+        cleanup_dist_env_and_memory()
+        _assert_same_tokens(mixed[i], reference, atol=1e-4)
 
 
 @pytest.mark.parametrize("looped", [False, True])

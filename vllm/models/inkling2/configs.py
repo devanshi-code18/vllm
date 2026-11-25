@@ -57,6 +57,7 @@ class Inkling2ModelConfig(PreTrainedConfig):
         use_gate_bias: bool = True,
         loop_config: dict[str, int | bool] | None = None,
         loop_num_passes: int | None = None,
+        loop_max_passes: int | None = None,
         loop_share_cache: bool = False,
         tie_word_embeddings: bool = False,
         **kwargs: Any,
@@ -126,9 +127,12 @@ class Inkling2ModelConfig(PreTrainedConfig):
         self.loop_config = loop_config
         # Serving options of variable-loop checkpoints (set through
         # --hf-overrides '{"text_config": {...}}'): the number of loop passes
-        # (None: the checkpoint's), and one KV cache per core layer shared by
-        # all passes instead of one per pass (conv states stay per pass).
+        # (None: the checkpoint's); the largest per-request count
+        # (`SamplingParams.extra_args["loops"]`, None: no per-request counts);
+        # and one KV cache per core layer shared by all passes instead of one
+        # per pass (conv states stay per pass).
         self.loop_num_passes = loop_num_passes
+        self.loop_max_passes = loop_max_passes
         self.loop_share_cache = loop_share_cache
         if loop_config is not None:
             self.check_loop_options()
@@ -144,24 +148,72 @@ class Inkling2ModelConfig(PreTrainedConfig):
         """Validate the loop serving options (again once overrides are set)."""
         loop = self.loop_config
         varloop = loop is not None and loop["is_varloop"]
-        if (self.loop_num_passes is not None or self.loop_share_cache) and not varloop:
+        options = (self.loop_num_passes, self.loop_max_passes)
+        if (any(o is not None for o in options) or self.loop_share_cache) and (
+            not varloop
+        ):
             raise ValueError(
-                "loop_num_passes and loop_share_cache need a checkpoint with "
-                "loop_config.is_varloop=true"
+                "loop_num_passes, loop_max_passes and loop_share_cache need a "
+                "checkpoint with loop_config.is_varloop=true"
             )
-        if loop is not None and self.num_loop_passes < (1 if varloop else 2):
+        if loop is not None and self.default_loop_passes < (1 if varloop else 2):
             raise ValueError(
                 f"This loop checkpoint needs at least {1 if varloop else 2} passes, "
-                f"got {self.num_loop_passes}"
+                f"got {self.default_loop_passes}"
             )
+        if self.loop_max_passes is not None:
+            if self.loop_max_passes < self.default_loop_passes:
+                raise ValueError(
+                    f"loop_max_passes ({self.loop_max_passes}) is below the "
+                    f"default pass count ({self.default_loop_passes})"
+                )
+            if self.loop_share_cache:
+                # Every pass of every row writes the shared cache, so rows
+                # that stop early would keep a later pass's K/V.
+                raise ValueError(
+                    "Per-request loop counts (loop_max_passes) need per-pass KV "
+                    "caches; drop loop_share_cache"
+                )
 
     @property
-    def num_loop_passes(self) -> int:
+    def default_loop_passes(self) -> int:
+        """The pass count of requests that do not set `loops`."""
         if self.loop_config is None:
             return 1
         if self.loop_num_passes is not None:
             return self.loop_num_passes
         return int(self.loop_config["num_passes"])
+
+    @property
+    def num_loop_passes(self) -> int:
+        """The passes the caches and layer visits are built for: the largest
+        per-request count, else the default."""
+        if self.loop_max_passes is not None:
+            return self.loop_max_passes
+        return self.default_loop_passes
+
+    def request_loop_passes(self, extra_args: dict[str, Any] | None) -> int:
+        """A request's pass count from `extra_args["loops"]` (an int from 1 to
+        `loop_max_passes`), else the default."""
+        loops = (extra_args or {}).get("loops")
+        if loops is None:
+            return self.default_loop_passes
+        if type(loops) is not int:
+            raise ValueError(f"loops must be an integer, got {loops!r}")
+        if loops == self.default_loop_passes:
+            return loops
+        if self.loop_max_passes is None:
+            raise ValueError(
+                f"This server runs {self.default_loop_passes} loop passes for "
+                "every request; start it with "
+                '--hf-overrides \'{"text_config": {"loop_max_passes": N}}\' '
+                "to choose them per request"
+            )
+        if not 1 <= loops <= self.loop_max_passes:
+            raise ValueError(
+                f"loops must be between 1 and {self.loop_max_passes}, got {loops}"
+            )
+        return loops
 
     @property
     def num_layer_visits(self) -> int:
@@ -223,6 +275,18 @@ class Inkling2MMConfig(PreTrainedConfig):
     def get_text_config(self, *args: Any, **kwargs: Any) -> Inkling2ModelConfig:
         return self.text_config
 
+    def request_cache_salt(
+        self, extra_args: dict[str, Any], cache_salt: str | None
+    ) -> str | None:
+        """Validate a request's `loops` and keep requests with other pass
+        counts out of its prefix-cache blocks: the coda's K/V depend on the
+        count, and a request writes only its own passes' caches."""
+        text = self.text_config
+        loops = text.request_loop_passes(extra_args)
+        if loops == text.default_loop_passes:
+            return cache_salt
+        return f"{cache_salt or ''}|inkling2-loops={loops}"
+
 
 class Inkling2LoopMMConfig(Inkling2MMConfig):
     model_type = "inkling2_loop"
@@ -270,6 +334,11 @@ class Inkling2DSparkConfig(PreTrainedConfig):
             raise ValueError("The Inkling2 checkpoint has no mtp_config")
         text = config.text_config
         loop = text.loop_config
+        if text.loop_max_passes is not None:
+            raise ValueError(
+                "Inkling2 DSpark drafts read hidden states at fixed layer visits; "
+                "per-request loop counts (loop_max_passes) do not support them"
+            )
         if loop is not None and text.num_loop_passes != loop["num_passes"]:
             raise ValueError(
                 "Inkling2 DSpark drafts read hidden states at fixed layer visits; "
