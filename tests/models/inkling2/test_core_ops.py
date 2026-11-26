@@ -292,6 +292,13 @@ def test_loop_blend_matches_per_stream_controllers(tokens):
         torch.testing.assert_close(out[s].float(), ref.float(), atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.skipif(
+    not (
+        current_platform.is_device_capability_family(80)
+        or current_platform.is_device_capability(90)
+    ),
+    reason="fused loop controllers run on SM8x and SM90",
+)
 @pytest.mark.parametrize("tokens", [1, 8, 32, 256])
 @pytest.mark.parametrize("streams,broadcast", [(3, True), (3, False), (1, False)])
 def test_fused_loop_blend_rounds_like_fp64_controller(tokens, streams, broadcast):
