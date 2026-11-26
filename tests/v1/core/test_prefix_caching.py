@@ -47,6 +47,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager, Request
@@ -6831,6 +6832,80 @@ def test_mamba_decode_resume_skips_off_boundary_checkpoint_block(async_schedulin
     probe = make_request("probe", req.all_token_ids[:96], hash_block_size, sha256)
     _, num_hit_tokens, _ = manager.get_computed_blocks(probe)
     assert num_hit_tokens == 0
+
+
+@pytest.mark.parametrize(
+    ("swa_block_size", "sliding_window"),
+    [(16, 32), (4, 4)],  # attention-like; Inkling short-conv-like
+)
+def test_swa_sparse_retention_caches_decode_resume_window_on_free(
+    swa_block_size, sliding_window
+):
+    """The SWA analog of the Mamba decode resume state: once the request is
+    freed, sparse retention caches the window ending at the latest boundary
+    decode crossed, so the next turn replaying the output hits through the
+    answer instead of only through its own prompt."""
+    block_size = 16
+    kv_cache_config = _make_hybrid_kv_cache_config(
+        block_size, 200, ["full", "sliding_window"]
+    )
+    _replace_group(
+        kv_cache_config, 1, block_size=swa_block_size, sliding_window=sliding_window
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=swa_block_size,
+        retention_interval=0,
+    )
+    need = cdiv(sliding_window - 1, swa_block_size)
+
+    prompt = [i for i in range(3) for _ in range(block_size)] + [3] * 4
+    req0 = make_request("0", prompt, swa_block_size, sha256)
+    blocks = manager.allocate_slots(req0, len(prompt))
+    assert blocks is not None
+    req0.num_computed_tokens = len(prompt)
+    # Decode crosses boundaries 64, 80 and 96. Holding the window at the latest
+    # one costs at most one block beyond the live window.
+    max_held = 0
+    for token in range(100, 156):
+        req0.append_output_token_ids(token)
+        assert manager.allocate_slots(req0, 1) is not None
+        req0.num_computed_tokens += 1
+        held = manager.get_blocks(req0.request_id).blocks[1]
+        max_held = max(max_held, sum(not b.is_null for b in held))
+    assert max_held <= need + 2
+
+    pool = manager.block_pool
+
+    def cached_swa_blocks() -> set[int]:
+        # Hashes are per SWA block (hash_block_size == swa_block_size).
+        return {
+            i
+            for i, block_hash in enumerate(req0.block_hashes)
+            if pool.get_cached_block(block_hash, kv_cache_group_ids=[1])
+        }
+
+    def window_ending_at(num_tokens: int) -> set[int]:
+        end = num_tokens // swa_block_size
+        return set(range(end - need, end))
+
+    # The prompt's replay boundary (52 -> 48) is cached during prefill; the
+    # window at 96 only when the request is freed.
+    assert cached_swa_blocks() == window_ending_at(48)
+    manager.free(req0)
+    assert cached_swa_blocks() == window_ending_at(48) | window_ending_at(96)
+
+    req1 = make_request(
+        "1", list(req0.all_token_ids) + [7] * 20, swa_block_size, sha256
+    )
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
+    assert num_computed_tokens == 6 * block_size
+    assert [len(blocks) for blocks in computed_blocks.blocks] == [
+        6,
+        6 * block_size // swa_block_size,
+    ]
 
 
 @pytest.mark.skip_global_cleanup

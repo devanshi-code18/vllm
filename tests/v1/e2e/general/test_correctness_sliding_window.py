@@ -131,6 +131,33 @@ def test_hybrid_sliding_window_honors_user_block_size(vllm_runner):
     assert outputs[0].num_cached_tokens == block_size
 
 
+def test_hybrid_sliding_window_next_turn_hits_through_answer(vllm_runner):
+    """A follow-up turn replaying the previous answer must hit the prefix cache
+    through that answer, not stop at the previous prompt. Guards against the
+    sliding-window group caching windows only at prompt boundaries, which makes
+    every turn of a chat re-prefill the previous answer.
+    """
+    prompt = [101 + i % 97 for i in range(677)]  # longer than the 512 window
+    answer_params = SamplingParams(temperature=0.0, max_tokens=100, ignore_eos=True)
+    with vllm_runner(
+        "google/gemma-3-1b-it",
+        enable_prefix_caching=True,
+        max_model_len=2048,
+        enforce_eager=True,
+    ) as runner:
+        llm = runner.get_llm()
+        turn1 = llm.generate([{"prompt_token_ids": prompt}], answer_params)[0]
+        history = prompt + list(turn1.outputs[0].token_ids)
+        turn2 = llm.generate(
+            [{"prompt_token_ids": history + [102] * 20}], SamplingParams(max_tokens=1)
+        )[0]
+    # Turn 1 computed 776 tokens (the last answer token never runs), which
+    # floor to 768 at any hit alignment up to 256. A hit that stops at the
+    # previous prompt lands at or below 672.
+    assert len(history) - 1 == 776
+    assert turn2.num_cached_tokens == 768
+
+
 def check_length(prompts: list[str], llm: LLM, sliding_window: int):
     """Check if the prompt length is valid, i.e., longer than the sliding window
     size and shorter than the model's max length.

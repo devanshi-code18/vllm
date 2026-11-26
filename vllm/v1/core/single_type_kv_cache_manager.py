@@ -1070,6 +1070,8 @@ class RSWAManager(FullAttentionManager):
 
 
 class SlidingWindowManager(SingleTypeKVCacheManager):
+    supports_decode_resume_window: ClassVar[bool] = True
+
     @dataclass(frozen=True, slots=True)
     class Params(SingleTypeKVCacheManager.Params):
         sliding_window: int
@@ -1154,6 +1156,16 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         params = self.manager_config.params
         assert isinstance(params, SlidingWindowManager.Params)
         self.num_retained_tokens = self.sliding_window_reach(self.manager_config)
+        # Sparse retention caches the window at the latest boundary decode
+        # crossed when the request is freed, so a follow-up turn resumes there.
+        self.keep_decode_resume_window = (
+            self.supports_decode_resume_window
+            and self.enable_caching
+            and self.retention_interval is not None
+            and self.prefix_cacheable(self.manager_config)
+        )
+        # Request ID -> held decode resume window blocks `[start, end)`.
+        self._decode_resume_windows: dict[str, tuple[int, int]] = {}
 
     @classmethod
     def find_longest_cache_hit(
@@ -1348,6 +1360,100 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         """
         return max(0, num_computed_tokens - self.num_retained_tokens)
 
+    def _decode_resume_window(
+        self, processed_tokens: int, num_prompt_tokens: int
+    ) -> tuple[int, int] | None:
+        """Blocks `[start, end)` a hit at the latest boundary decode crossed
+        past the prompt reads, or `None` if there is none."""
+        alignment = self.cache_hit_alignment_tokens
+        if alignment % self.block_size != 0:
+            # `reachable_block_mask` is dense here, so decode blocks are cached.
+            return None
+        boundary = processed_tokens // alignment * alignment
+        if boundary <= num_prompt_tokens:
+            # The replay boundaries already retain the prompt's tail.
+            return None
+        params = self.manager_config.params
+        assert isinstance(params, SlidingWindowManager.Params)
+        end = boundary // self.block_size
+        return max(0, end - cdiv(params.sliding_window - 1, self.block_size)), end
+
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        processed_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
+    ) -> None:
+        window = None
+        if self.keep_decode_resume_window and num_prompt_tokens is not None:
+            window = self._decode_resume_window(
+                processed_computed_tokens, num_prompt_tokens
+            )
+        held = self._decode_resume_windows.pop(request_id, None)
+        if held is not None and held != window:
+            # Release the previous window's blocks that attention skips.
+            blocks = self.req_to_blocks[request_id]
+            num_skipped_blocks = min(
+                self.get_num_skipped_tokens(processed_computed_tokens)
+                // self.block_size,
+                len(blocks),
+            )
+            freed: list[KVCacheBlock] = []
+            for i in range(min(held[1], num_skipped_blocks) - 1, held[0] - 1, -1):
+                if blocks[i].is_null or (window and window[0] <= i < window[1]):
+                    continue
+                freed.append(blocks[i])
+                blocks[i] = self._null_block
+            if freed:
+                self.block_pool.free_blocks(freed)
+        if window is None:
+            super().remove_skipped_blocks(
+                request_id, processed_computed_tokens, num_prompt_tokens
+            )
+            return
+        # Hold the window until decode crosses the next boundary; free the
+        # skipped blocks on either side of it.
+        self._decode_resume_windows[request_id] = window
+        num_skipped_blocks = min(
+            self.get_num_skipped_tokens(processed_computed_tokens) // self.block_size,
+            len(self.req_to_blocks[request_id]),
+        )
+        self._remove_blocks_in_range(request_id, window[1], num_skipped_blocks)
+        self._remove_blocks_in_range(request_id, 0, min(window[0], num_skipped_blocks))
+
+    def cache_blocks_on_free(self, request: Request) -> None:
+        """Cache the window at the latest boundary decode crossed, so a
+        follow-up turn replaying the output resumes there."""
+        if not self.keep_decode_resume_window:
+            return
+        window = self._decode_resume_window(
+            max(0, request.num_computed_tokens - request.num_in_flight_tokens),
+            request.num_prompt_tokens,
+        )
+        if window is None:
+            return
+        start, end = window
+        blocks = self.req_to_blocks.get(request.request_id, [])
+        num_hashed_tokens = len(request.block_hashes) * self.block_pool.hash_block_size
+        if end > len(blocks) or num_hashed_tokens < end * self.block_size:
+            return
+        window_blocks = blocks[start:end]
+        if any(block.is_null for block in window_blocks):
+            return
+        self.block_pool.cache_full_blocks(
+            request=request,
+            blocks=blocks,
+            num_cached_blocks=start,
+            num_full_blocks=end,
+            block_size=self.block_size,
+            kv_cache_group_id=self.kv_cache_group_id,
+            block_mask=[block.block_hash is None for block in window_blocks],
+        )
+
+    def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+        self._decode_resume_windows.pop(request_id, None)
+        return super().pop_blocks_for_free(request_id)
+
 
 class DFlashSlidingWindowManager(SlidingWindowManager):
     """Regular-attention sliding-window drafter KV read only near the end.
@@ -1366,6 +1472,8 @@ class DFlashSlidingWindowManager(SlidingWindowManager):
     only past the last target token, and everything from `h` on is
     recomputed.
     """
+
+    supports_decode_resume_window: ClassVar[bool] = False
 
     @dataclass(frozen=True, slots=True)
     class Params(SlidingWindowManager.Params):
