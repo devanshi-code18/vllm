@@ -47,6 +47,7 @@ from vllm.v1.worker.replayssm_utils import (
     initialize_replayssm_ring_trackers,
 )
 from vllm.v1.worker.utils import (
+    _block_copy_runs,
     allocate_kv_cache,
     bind_kv_cache,
     bind_kv_cache_to_layers,
@@ -635,6 +636,25 @@ def test_copy_kv_cache_blocks_inplace_cuda_skips_gather_temporary():
 
     assert torch.accelerator.max_memory_allocated() - allocated < cache[0].nbytes
     torch.testing.assert_close(cache, expected)
+
+
+def test_block_copy_runs_one_run_per_permuted_dense_block():
+    """A block whose dims are dense in some order (a token-major K/V page seen
+    as `[2, tokens, width]`) copies as one run, not one per token row: each run
+    is a kernel program, and hybrid models copy whole state blocks this way."""
+    cache = torch.zeros(4, 576, 2, 64, dtype=torch.bfloat16).transpose(1, 2)
+    runs = _block_copy_runs(cache, np.array([[1, 2], [3, 0]]))
+    assert runs.shape == (3, 2)
+    assert runs[:2].tolist() == [
+        [cache[1].data_ptr(), cache[2].data_ptr()],
+        [cache[3].data_ptr(), cache[0].data_ptr()],
+    ]
+    assert (runs[2] == cache[0].numel() * cache.element_size()).all()
+    # A strided slice is not dense: it keeps one run per row.
+    assert _block_copy_runs(cache[:, :, :, :32], np.array([[1], [3]])).shape == (
+        3,
+        2 * 576,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
