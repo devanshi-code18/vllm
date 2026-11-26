@@ -208,8 +208,9 @@ class CacheConfig:
     be set finer than the physical KV cache block sizes (e.g. 32 vs a
     1024-token hybrid-model block) as long as every KV cache group's
     `block_size` is divisible by it, enabling cache hits at boundaries
-    inside a physical block. It controls matching granularity only, not how
-    often states are stored.
+    inside a physical block. It controls matching granularity, not how often
+    states are stored, except that hybrid Mamba models also checkpoint their
+    decode state at these boundaries (one spare Mamba block per request).
 
     An explicit value fails at startup if prefix-cache hits would fall back
     to the scheduler block size (for example, when a sliding-window group

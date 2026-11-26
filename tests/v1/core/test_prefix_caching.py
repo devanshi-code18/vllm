@@ -6833,6 +6833,101 @@ def test_mamba_decode_resume_skips_off_boundary_checkpoint_block(async_schedulin
     assert num_hit_tokens == 0
 
 
+@pytest.mark.parametrize("retention", [0, None])
+def test_mamba_decode_checkpoint_hits_inside_a_block(retention):
+    """With a prefix match unit below the Mamba block, decode copies its state
+    at each unit boundary into one spare block, cached on free, so the next
+    turn hits within one unit of the answer instead of at the last block end."""
+    unit, block_size = 16, 64
+    kv_cache_config = _make_hybrid_kv_cache_config(block_size, 200, ["full", "mamba"])
+    _replace_group(kv_cache_config, 1, num_decode_checkpoint_blocks=1)
+    manager = make_kv_cache_manager(
+        kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=unit,
+        retention_interval=retention,
+    )
+    pool = manager.block_pool
+
+    req0 = make_request("0", list(range(70)), unit, sha256)
+    assert manager.allocate_slots(req0, 70) is not None
+    req0.num_computed_tokens = 70
+    copies: dict[int, list[tuple[int, int]]] = {}
+    for token in range(1000, 1050):  # decode steps start at 70..119
+        req0.append_output_token_ids(token)
+        assert manager.allocate_slots(req0, 1) is not None
+        step_copies, retained = manager.take_kv_cache_block_copies()
+        pool.free_blocks(retained)  # the scheduler frees these after the step
+        if step_copies:
+            copies[req0.num_computed_tokens] = [
+                (c.src_block_id, c.dst_block_id) for c in step_copies
+            ]
+        req0.num_computed_tokens += 1
+    running_block_id = manager.get_block_ids(req0.request_id)[1][1]
+
+    manager.free(req0)
+    req1 = make_request("1", list(req0.all_token_ids) + [7] * 20, unit, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
+    # The last boundary decode started a step at, not the block end at 64.
+    assert num_computed_tokens == 112
+    spare_block_id = computed_blocks.blocks[1][-1].block_id
+    # One copy per unit boundary inside block 1 (64..128), into the same spare.
+    assert copies == {
+        position: [(running_block_id, spare_block_id)] for position in (80, 96, 112)
+    }
+
+
+def test_mamba_decode_checkpoint_extends_the_superseded_state_chain():
+    """A cached decode checkpoint is the newest state a turn leaves, so the
+    next turn that resumes from it extends the conversation's tip chain: two
+    turns later, the first turn's checkpoint is deprioritized."""
+    unit, block_size = 16, 64
+    kv_cache_config = _make_hybrid_kv_cache_config(block_size, 200, ["full", "mamba"])
+    _replace_group(kv_cache_config, 1, num_decode_checkpoint_blocks=1)
+    manager = make_kv_cache_manager(
+        kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=unit,
+        retention_interval=0,
+    )
+    pool = manager.block_pool
+
+    def run_turn(req_id: str, prompt: list[int]) -> tuple[Request, int]:
+        manager.new_step_starts()
+        req = make_request(req_id, prompt, unit, sha256)
+        blocks, hit, junction = manager.get_computed_blocks(req)
+        req.shared_prefix_boundary = junction
+        assert manager.allocate_slots(req, len(prompt) - hit, hit, blocks)
+        req.num_computed_tokens = len(prompt)
+        for token in range(1000, 1050):
+            req.append_output_token_ids(token)
+            assert manager.allocate_slots(req, 1) is not None
+            pool.free_blocks(manager.take_kv_cache_block_copies()[1])
+            req.num_computed_tokens += 1
+        req.status = RequestStatus.FINISHED_STOPPED
+        manager.free(req)
+        return req, hit
+
+    turn1, _ = run_turn("t1", list(range(70)))
+    turn2, hit2 = run_turn("t2", list(turn1.all_token_ids) + [7] * 20)
+    turn3, hit3 = run_turn("t3", list(turn2.all_token_ids) + [8] * 20)
+    # Each turn resumes from the previous turn's checkpoint, not a block end.
+    assert (hit2, hit3) == (112, 176)
+
+    num_uncached = sum(
+        b.block_hash is None for b in pool.free_block_queue.get_all_free_blocks()
+    )
+    pool.get_new_blocks(num_uncached)
+    assert pool.get_cached_block(turn1.block_hashes[6], [1]) is not None
+    # The next eviction takes turn 1's superseded checkpoint, ahead of turn 2's
+    # one-turn fallback and every normal LRU-cached block.
+    pool.get_new_blocks(1)
+    assert pool.get_cached_block(turn1.block_hashes[6], [1]) is None
+    assert pool.get_cached_block(turn2.block_hashes[10], [1]) is not None
+
+
 @pytest.mark.parametrize(
     ("swa_block_size", "sliding_window"),
     [(16, 32), (4, 4)],  # attention-like; Inkling short-conv-like

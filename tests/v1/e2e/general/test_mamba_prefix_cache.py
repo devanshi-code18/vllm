@@ -1075,3 +1075,31 @@ def test_mamba_mid_block_resume_exports_into_resumed_block(
         del engine
         torch.accelerator.empty_cache()
         cleanup_dist_env_and_memory()
+
+
+def test_mamba_next_turn_hits_inside_answer_block(vllm_runner):
+    """With a prefix match unit below the Mamba block, a follow-up turn
+    replaying the previous answer must hit within one unit of the answer's
+    end. Guards the decode checkpoints: without them the hit stops at the
+    previous prompt or the last Mamba block boundary decode crossed.
+    """
+    prompt = [101 + i % 97 for i in range(700)]
+    answer_params = SamplingParams(temperature=0.0, max_tokens=300, ignore_eos=True)
+    with vllm_runner(
+        "Qwen/Qwen3.5-0.8B",
+        enable_prefix_caching=True,
+        prefix_match_unit=64,
+        max_model_len=2048,
+        enforce_eager=True,
+        limit_mm_per_prompt={"image": 0, "video": 0},
+    ) as runner:
+        llm = runner.get_llm()
+        turn1 = llm.generate([{"prompt_token_ids": prompt}], answer_params)[0]
+        history = prompt + list(turn1.outputs[0].token_ids)
+        turn2 = llm.generate(
+            [{"prompt_token_ids": history + [102] * 20}], SamplingParams(max_tokens=1)
+        )[0]
+    # Turn 1 computed 999 tokens (the last answer token never runs); the latest
+    # 64-token boundary is 960, inside the second 576-token Mamba block.
+    assert len(history) - 1 == 999
+    assert turn2.num_cached_tokens == 960

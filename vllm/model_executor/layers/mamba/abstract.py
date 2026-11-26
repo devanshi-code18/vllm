@@ -105,6 +105,9 @@ class MambaBase(AttentionLayerBase):
             num_speculative_blocks=get_mamba_num_speculative_blocks(vllm_config),
             num_prefill_checkpoint_blocks=int(checkpoint_alignment is not None),
             prefill_checkpoint_alignment=checkpoint_alignment,
+            num_decode_checkpoint_blocks=get_mamba_num_decode_checkpoint_blocks(
+                vllm_config
+            ),
         )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
@@ -119,6 +122,26 @@ def get_mamba_num_speculative_blocks(vllm_config: VllmConfig) -> int:
     if vllm_config.cache_config.use_replayssm:
         return 0
     return vllm_config.num_speculative_tokens
+
+
+def get_mamba_num_decode_checkpoint_blocks(vllm_config: VllmConfig) -> int:
+    """Spare state blocks each request reserves to checkpoint its decode state
+    at the prefix-match boundaries inside a Mamba block."""
+    cache_config = vllm_config.cache_config
+    unit = cache_config.prefix_match_unit
+    mamba_block_size = cache_config.mamba_block_size
+    if (
+        not cache_config.enable_prefix_caching
+        or unit is None
+        or mamba_block_size is None
+        or unit >= mamba_block_size
+        # ReplaySSM writes the state back only on flush, and a speculative
+        # step can step over a boundary.
+        or cache_config.use_replayssm
+        or vllm_config.num_speculative_tokens > 0
+    ):
+        return 0
+    return 1
 
 
 def get_kv_cache_checkpoint_alignment(

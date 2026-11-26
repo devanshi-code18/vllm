@@ -29,6 +29,8 @@ vllm serve <hybrid-model> \
 
 `--prefix-match-unit` is required. It sets the granularity at which prefix-cache keys are computed. When unset it defaults to the greatest common divisor of the prefix-cacheable KV cache group block sizes. For hybrid Mamba models that is the block size itself, so no sub-block boundary exists and the flag has no effect.
 
+With `--prefix-match-unit` smaller than the Mamba block size, decode also copies the running state into one spare Mamba block per request at each unit boundary, and caches it when the request finishes. A follow-up chat turn then resumes within one unit of the previous answer instead of at the last Mamba block boundary. This costs one state copy per unit of decoded tokens and one extra Mamba block per request; ReplaySSM and speculative decoding skip it.
+
 Choose a value that divides the block size of every prefix-cacheable KV cache group, matches the block size of any group that requires block-aligned lookups (such as sliding-window attention), and is a multiple of the per-state compression ratio for models that use one, such as sparse MLA. vLLM validates these at startup and fails if an explicit value would disable partial cache hits. Read the served block size from the startup log. 64 is a reasonable starting point.
 
 ### Superseded Mamba state eviction
