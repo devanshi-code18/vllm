@@ -985,6 +985,16 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
                 setattr(layer, name, torch.empty(0, dtype=torch.int32))
 
 
+def _is_dense_in_some_order(shape: list[int], strides: list[int]) -> bool:
+    """Whether the dims tile one dense range when ordered by stride."""
+    expected = 1
+    for stride, size in sorted((st, sz) for sz, st in zip(shape, strides) if sz != 1):
+        if stride != expected:
+            return False
+        expected *= size
+    return True
+
+
 def _block_copy_runs(blocks: torch.Tensor, block_ids: np.ndarray) -> np.ndarray:
     """Split copies between the `[2, num_copies]` source and destination
     `block_ids` of `blocks` into contiguous runs.
@@ -996,6 +1006,10 @@ def _block_copy_runs(blocks: torch.Tensor, block_ids: np.ndarray) -> np.ndarray:
     """
     shape, strides = list(blocks.shape[1:]), list(blocks.stride()[1:])
     run_len = 1
+    if _is_dense_in_some_order(shape, strides):
+        # e.g. a token-major K/V page viewed as `[2, tokens, ...]`: one run per
+        # block instead of one per token row.
+        shape, strides, run_len = [], [], math.prod(shape)
     while shape and (shape[-1] == 1 or strides[-1] == run_len):
         run_len *= shape.pop()
         strides.pop()
