@@ -330,7 +330,7 @@ def fused_controller(
     assert (2 * d) % _BK == 0 and _K_GROUP % _BK == 0
     # Smaller batches spread the down projection's columns and the blend's
     # chunks over more programs (tuned on A100).
-    block_r = 16 if num_tokens <= 16 else 32
+    block_r = min(16 if num_tokens <= 16 else 32, rank)
     block_c = 64 if num_tokens <= 64 else 128
     groups = triton.cdiv(2 * d, _K_GROUP)
     splits = rank // block_r

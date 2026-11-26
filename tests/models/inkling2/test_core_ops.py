@@ -299,9 +299,10 @@ def test_loop_blend_matches_per_stream_controllers(tokens):
     ),
     reason="fused loop controllers run on SM8x and SM90",
 )
+@pytest.mark.parametrize("rank", [16, 64])
 @pytest.mark.parametrize("tokens", [1, 8, 32, 256])
 @pytest.mark.parametrize("streams,broadcast", [(3, True), (3, False), (1, False)])
-def test_fused_loop_blend_rounds_like_fp64_controller(tokens, streams, broadcast):
+def test_fused_loop_blend_rounds_like_fp64_controller(tokens, streams, broadcast, rank):
     """The fused small-batch controllers (the attention q/k/v streams, as a
     local layer or a full layer, and the MLP stream) against an fp64
     controller with the reference's bf16 roundings of the pair and the
@@ -313,7 +314,7 @@ def test_fused_loop_blend_rounds_like_fp64_controller(tokens, streams, broadcast
         use_fused_controller,
     )
 
-    dim, rank = 2304, 64
+    dim = 2304
     gen = torch.Generator(device=DEVICE).manual_seed(tokens * 10 + streams)
 
     def randn(*shape):
