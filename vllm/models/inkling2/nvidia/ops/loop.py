@@ -292,12 +292,15 @@ def _counter(stream: int) -> torch.Tensor:
 
 
 def use_fused_controller(message: torch.Tensor) -> bool:
-    """Small batches off SM12x (which runs the controllers on its split-K
-    `ll_gemm`)."""
+    """Small batches on SM8x and SM90. SM10x gains little over cuBLAS and
+    SM12x runs the controllers on its split-K `ll_gemm`."""
     return (
         0 < message.shape[1] <= FUSED_MAX_TOKENS
         and message.shape[2] % _BK == 0
-        and not current_platform.is_device_capability_family(120)
+        and (
+            current_platform.is_device_capability_family(80)
+            or current_platform.is_device_capability(90)
+        )
     )
 
 

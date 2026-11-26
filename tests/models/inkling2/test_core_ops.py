@@ -301,11 +301,9 @@ def test_fused_loop_blend_rounds_like_fp64_controller(tokens, streams, broadcast
     controller with the reference's bf16 roundings of the pair and the
     hidden state: at most 3% of outputs miss the correctly rounded bf16 (a
     hidden value on a rounding boundary moves its whole row), and each row is
-    deterministic and independent of the rest of the batch."""
-    from vllm.models.inkling2.nvidia.ops.loop import (
-        fused_controller,
-        use_fused_controller,
-    )
+    deterministic and independent of the rest of the batch. Only SM8x and
+    SM90 select these kernels, but they are plain Triton and run anywhere."""
+    from vllm.models.inkling2.nvidia.ops.loop import fused_controller
 
     dim = 2304
     gen = torch.Generator(device=DEVICE).manual_seed(tokens * 10 + streams)
@@ -319,7 +317,6 @@ def test_fused_loop_blend_rounds_like_fp64_controller(tokens, streams, broadcast
     dest = randn(lead, tokens, dim).expand(streams, -1, -1)
     message = randn(streams, tokens, dim)
     norm_weight = randn(lead, dim).bfloat16().expand(streams, -1)
-    assert use_fused_controller(message)
 
     out = fused_controller(dest, message, down, up, norm_weight, 1e-6)
 
