@@ -404,14 +404,18 @@ class Inkling2MoE(nn.Module):
             is_padding = get_forward_context().is_padding
         if not (experts.sm100 or experts.sm120):
             tokens = x.shape[0]
-            if (
-                experts.fused_align
+            block_m = (
+                experts.humming.block_sizes(tokens * gate.topk, gate.weight.shape[0])
+                if experts.fused_align
                 and tokens <= ALIGN_MAX_TOKENS
                 and isinstance(experts.humming, HummingExperts)
-            ):
-                block_m = experts.humming.block_sizes(
-                    tokens * gate.topk, gate.weight.shape[0]
-                )
+                else None
+            )
+            alignments: (
+                dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None
+            ) = None
+            # `select_and_align` lays out power-of-two row blocks only.
+            if block_m is not None and all(b & (b - 1) == 0 for b in block_m.values()):
                 selected, alignments = select_and_align(
                     x,
                     gate.weight,
@@ -424,7 +428,6 @@ class Inkling2MoE(nn.Module):
                     tuple(dict.fromkeys(block_m.values())),
                     is_padding,
                 )
-                routing = (*selected, alignments)
             else:
                 selected = select_experts(
                     x,
@@ -435,8 +438,7 @@ class Inkling2MoE(nn.Module):
                     experts.expert_bounds,
                     is_padding,
                 )
-                routing = (*selected, None)
-            return experts(x, routing, None, None, reduce, push)
+            return experts(x, (*selected, alignments), None, None, reduce, push)
         plan = experts.plan(x.shape[0])
         routing, quantized = route(
             x,
