@@ -1723,6 +1723,43 @@ def test_cache_aware_admission_is_safe_on_a_mamba_spec():
     assert [r.request_id for r in scheduler.waiting] == ["a", "b", "c"]
 
 
+def test_deferred_mamba_hit_does_not_block_the_queue():
+    """A request whose hit ends on a block filled this step waits a step, as
+    Mamba state cannot be read in the step that writes it. The requests behind
+    it are still admitted, and it keeps its place for the next step."""
+    block_size = 16
+    scheduler = create_scheduler(
+        max_num_seqs=2,
+        enable_prefix_caching=True,
+        block_size=block_size,
+        mamba_layer_config=MambaManager.layer_config(
+            MambaSpec(block_size=block_size, shapes=((1, 1),), dtypes=(torch.float32,)),
+            enable_prefix_caching=True,
+        ),
+    )
+    num_tokens = 3 * block_size + 5
+    a, b, c = create_requests(
+        num_requests=3, num_tokens=num_tokens, max_tokens=1, req_ids=["a", "b", "c"]
+    )
+    (a_copy,) = create_requests(
+        num_requests=1, num_tokens=num_tokens, max_tokens=1, req_ids=["a_copy"]
+    )
+    for request in (a, a_copy, b, c):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert [r.req_id for r in output.scheduled_new_reqs] == ["a", "b"]
+    assert [r.request_id for r in scheduler.waiting] == ["a_copy", "c"]
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(req_ids=["a", "b"], sampled_token_ids=[[0], [0]]),
+    )
+
+    output = scheduler.schedule()
+    assert [r.req_id for r in output.scheduled_new_reqs] == ["a_copy", "c"]
+    assert output.num_scheduled_tokens["a_copy"] == num_tokens - 3 * block_size
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [

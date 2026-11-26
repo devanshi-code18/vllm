@@ -975,3 +975,10 @@ class KVCacheManager:
     def new_step_starts(self) -> None:
         """Notify the coordinator that a new step is starting."""
         self.coordinator.new_step_starts()
+
+    def defers_hit(self, new_computed_blocks: KVCacheBlocks) -> bool:
+        """Whether a request must wait a step to take this prefix-cache hit:
+        it ends on a block that a request scheduled earlier in this step fills
+        and a group cannot read until the next step (Mamba state). The request
+        can be skipped; it takes the full hit next step."""
+        return self.coordinator.defers_hit(new_computed_blocks.blocks)

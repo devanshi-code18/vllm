@@ -446,6 +446,15 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.new_step_starts()
 
+    def defers_hit(
+        self, new_computed_blocks: tuple[Sequence[KVCacheBlock], ...]
+    ) -> bool:
+        """Whether any group must wait a step to take this hit."""
+        return any(
+            manager.defers_hit(blocks)
+            for manager, blocks in zip(self.single_type_managers, new_computed_blocks)
+        )
+
 
 class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
     """KV cache coordinator to use if prefix caching is disabled or unsupported.

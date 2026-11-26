@@ -1292,6 +1292,12 @@ class Scheduler(SchedulerInterface):
                         effective_computed_tokens = max(
                             0, num_computed_tokens - self.prefix_replay_tokens
                         )
+                    if self.kv_cache_manager.defers_hit(new_computed_blocks):
+                        # The hit ends on a block this step fills: the request
+                        # keeps its place and takes the hit next step, while
+                        # the requests behind it are still admitted.
+                        skip_request(request_queue)
+                        continue
                     if self._ec_transfer_pending(request, effective_computed_tokens):
                         skip_request(request_queue)
                         continue
