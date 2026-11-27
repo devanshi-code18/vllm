@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ctypes
+from collections.abc import Callable
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -40,6 +42,8 @@ class MambaHybridModelState(DefaultModelState):
         super().__init__(vllm_config, model, encoder_cache, device)
         self.cache_config = vllm_config.cache_config
         self.prefix_caching = self.cache_config.enable_prefix_caching
+        # A pre-copy held until sync KV loads land.
+        self._deferred_copy: Callable[[], None] | None = None
         if self.prefix_caching:
             self._mamba_state_idx = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
@@ -73,9 +77,11 @@ class MambaHybridModelState(DefaultModelState):
         block_tables: tuple[torch.Tensor, ...],
         kv_cache_config: KVCacheConfig,
         num_computed_tokens: torch.Tensor,
+        defer_copy: bool = False,
     ) -> None:
         if not self.prefix_caching or input_batch.num_reqs == 0:
             return
+        self._deferred_copy = None
 
         mamba_group_ids = get_mamba_group_ids(get_mamba_groups(kv_cache_config))
         mamba_block_size, _ = get_mamba_group_params(kv_cache_config, mamba_group_ids)
@@ -95,10 +101,36 @@ class MambaHybridModelState(DefaultModelState):
         if crossed_rows.numel() == 0:
             return
 
+        self._deferred_copy = partial(
+            self._copy_crossed_states,
+            crossed_rows.tolist(),
+            previous_state_indices,
+            current_state_indices,
+            block_tables,
+            kv_cache_config,
+            mamba_group_ids,
+        )
+        if not defer_copy:
+            self.copy_deferred_state()
+
+    def copy_deferred_state(self) -> None:
+        copy, self._deferred_copy = self._deferred_copy, None
+        if copy is not None:
+            copy()
+
+    def _copy_crossed_states(
+        self,
+        crossed_rows: list[int],
+        previous_state_indices: torch.Tensor,
+        current_state_indices: torch.Tensor,
+        block_tables: tuple[torch.Tensor, ...],
+        kv_cache_config: KVCacheConfig,
+        mamba_group_ids: list[int],
+    ) -> None:
         copy_funcs_by_type = self._mamba_state_copy_funcs
         assert copy_funcs_by_type is not None
         forward_context = self.vllm_config.compilation_config.static_forward_context
-        for batch_idx in crossed_rows.tolist():
+        for batch_idx in crossed_rows:
             src_col = int(previous_state_indices[batch_idx])
             dst_col = int(current_state_indices[batch_idx])
             for group_id in mamba_group_ids:

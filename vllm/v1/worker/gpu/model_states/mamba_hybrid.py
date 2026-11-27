@@ -95,6 +95,8 @@ class MambaHybridModelState(DefaultModelState):
         # the postprocess copy machinery, so the per-step src columns and the
         # running state_idx are kept GPU-resident.
         self.prefix_caching = self.cache_config.enable_prefix_caching
+        # (num_reqs, idx_mapping) of a pre-copy held until sync KV loads land.
+        self._deferred_copy: tuple[int, torch.Tensor] | None = None
         self._use_replayssm_trackers = vllm_config.use_replayssm_trackers
         if self._use_replayssm_trackers:
             self._is_prefilling_gpu = torch.zeros(
@@ -178,6 +180,7 @@ class MambaHybridModelState(DefaultModelState):
         block_tables: tuple[torch.Tensor, ...],
         kv_cache_config: KVCacheConfig,
         num_computed_tokens: torch.Tensor,
+        defer_copy: bool = False,
     ) -> None:
         """Prepare each request's Mamba slot before the forward.
 
@@ -186,13 +189,13 @@ class MambaHybridModelState(DefaultModelState):
         """
         if not self.prefix_caching:
             return
+        self._deferred_copy = None
         num_reqs = input_batch.num_reqs
         if num_reqs == 0:
             return
         ctx = self._mamba_ctx
         assert ctx is not None
 
-        replayssm = ctx.replayssm
         # This decision kernel fast-exits per request when no block boundary is
         # crossed. Avoiding the launch would require a CPU sync under async
         # scheduling.
@@ -210,10 +213,20 @@ class MambaHybridModelState(DefaultModelState):
             BLOCK_SIZE=block,
             MAMBA_BLOCK_SIZE=ctx.block_size,
         )
+        self._deferred_copy = (num_reqs, input_batch.idx_mapping)
+        if not defer_copy:
+            self.copy_deferred_state()
 
-        if replayssm is not None:
-            replayssm.reset_new_slots(
-                idx_mapping=input_batch.idx_mapping,
+    def copy_deferred_state(self) -> None:
+        if self._deferred_copy is None:
+            return
+        num_reqs, idx_mapping = self._deferred_copy
+        self._deferred_copy = None
+        ctx = self._mamba_ctx
+        assert ctx is not None
+        if ctx.replayssm is not None:
+            ctx.replayssm.reset_new_slots(
+                idx_mapping=idx_mapping,
                 src_cols=self._mamba_src_col_gpu,
                 dst_cols=self._mamba_state_idx_gpu,
                 num_reqs=num_reqs,
@@ -223,7 +236,7 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_state_idx_gpu,
             self._mamba_src_col_gpu,
             self._mamba_src_off_gpu,
-            input_batch.idx_mapping,
+            idx_mapping,
         )
 
     def prepare_attn(

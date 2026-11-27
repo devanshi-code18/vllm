@@ -30,6 +30,9 @@ if TYPE_CHECKING:
 class KVConnector:
     """KV-transfer interface used by the CPU model runner."""
 
+    # Whether the Mamba state pre-copy waits for this step's sync loads.
+    defers_state_precopy = False
+
     def pre_forward(
         self,
         scheduler_output: "SchedulerOutput",
@@ -57,6 +60,7 @@ class ActiveKVConnector(KVConnector):
     ):
         self.vllm_config = vllm_config
         self.kv_connector = get_kv_transfer_group()
+        self.defers_state_precopy = self.kv_connector.loads_mamba_state_at_load_end
         # Register kv caches with KV Connector if applicable.
         self.kv_connector.register_kv_caches(kv_caches_dict)
         self.kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
