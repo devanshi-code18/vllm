@@ -22,12 +22,21 @@ from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
+    SupportsHMA,
 )
 from vllm.inputs import TokensPrompt
 from vllm.platforms import current_platform
 
-MODELS = ["Qwen/Qwen3-0.6B"]
-PREFIX_TOKENS = 512
+# (model, float32 layer inputs, sliding window). Gemma's input norm adds the
+# residual in float32, so only the unrounded sum reproduces its forward.
+MODELS = [
+    ("Qwen/Qwen3-0.6B", False, False),
+    ("google/gemma-3-1b-it", True, True),
+]
+# Block ids per KV cache group of every load the connector ran (in-process).
+LOADED_BLOCK_IDS: list[tuple[list[int], ...]] = []
+# Longer than Gemma 3's 512-token window: its sliding layers skip null blocks.
+PREFIX_TOKENS = 1024
 
 
 @dataclass
@@ -43,10 +52,12 @@ class _Metadata(KVConnectorMetadata):
     loads: list[_Load] = field(default_factory=list)
 
 
-class LayerInputsTestConnector(KVConnectorBase_V1):
+class LayerInputsTestConnector(KVConnectorBase_V1, SupportsHMA):
     """Takes a request's first `num_tokens` prompt tokens from the per-layer
     inputs in `kv_transfer_params["layer_inputs_path"]` (safetensors,
-    `layer_inputs` `[num_layers, num_tokens, hidden_size]`)."""
+    `layer_inputs` `[num_layers, num_tokens, hidden_size]`). Supports the
+    hybrid allocator, so sliding-window groups get null blocks before their
+    window."""
 
     def __init__(self, vllm_config, role, kv_cache_config):
         super().__init__(vllm_config, role, kv_cache_config)
@@ -80,6 +91,9 @@ class LayerInputsTestConnector(KVConnectorBase_V1):
         self._pending.pop(request.request_id, None)
         return False, None
 
+    def request_finished_all_groups(self, request, block_ids) -> tuple[bool, Any]:
+        return self.request_finished(request, [])
+
     def register_kv_from_layer_inputs_writer(self, writer) -> None:
         self._writer = writer
 
@@ -87,6 +101,7 @@ class LayerInputsTestConnector(KVConnectorBase_V1):
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, _Metadata)
         for load in metadata.loads:
+            LOADED_BLOCK_IDS.append(load.block_ids)
             assert self._writer is not None
             device = str(self._writer.device)
             inputs = load_file(load.path, device=device)["layer_inputs"]
@@ -103,7 +118,7 @@ class LayerInputsTestConnector(KVConnectorBase_V1):
         return
 
 
-def _capture_layer_inputs(model, captured: dict, num_tokens: int):
+def _capture_layer_inputs(model, captured: dict, num_tokens: int, float32: bool):
     """Record the input of every decoder layer for positions < num_tokens."""
 
     def hook(idx):
@@ -111,6 +126,9 @@ def _capture_layer_inputs(model, captured: dict, num_tokens: int):
             if not captured["active"]:
                 return
             positions, hidden, residual = args[:3]
+            if float32:
+                hidden = hidden.float()
+                residual = None if residual is None else residual.float()
             x = hidden if residual is None else hidden + residual
             keep = positions < num_tokens
             buf = captured.setdefault(
@@ -128,8 +146,10 @@ def _capture_layer_inputs(model, captured: dict, num_tokens: int):
     not (current_platform.is_cuda() and current_platform.has_device_capability(80)),
     reason="validated with batch invariance on NVIDIA SM80+ only",
 )
-@pytest.mark.parametrize("model", MODELS)
-def test_written_prefix_matches_prefix_cache_hit(model, tmp_path, monkeypatch):
+@pytest.mark.parametrize("model,float32_inputs,sliding_window", MODELS)
+def test_written_prefix_matches_prefix_cache_hit(
+    model, float32_inputs, sliding_window, tmp_path, monkeypatch
+):
     # The capture hooks share Python state with this process.
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
@@ -152,7 +172,9 @@ def test_written_prefix_matches_prefix_cache_hit(model, tmp_path, monkeypatch):
     question = [(i * 104729) % (vocab - 1000) + 500 for i in range(24)]
 
     captured: dict = {"active": True}
-    llm.apply_model(lambda m: _capture_layer_inputs(m, captured, PREFIX_TOKENS))
+    llm.apply_model(
+        lambda m: _capture_layer_inputs(m, captured, PREFIX_TOKENS, float32_inputs)
+    )
     llm.generate(
         [TokensPrompt(prompt_token_ids=prefix + question[:1])],
         SamplingParams(temperature=0.0, max_tokens=1),
@@ -186,6 +208,12 @@ def test_written_prefix_matches_prefix_cache_hit(model, tmp_path, monkeypatch):
         use_tqdm=False,
     )[0]
     assert written.num_cached_tokens == PREFIX_TOKENS
+    if sliding_window:
+        # The hybrid allocator is on: the sliding-window groups hold null
+        # blocks before their window, which the writer must skip.
+        block_ids = LOADED_BLOCK_IDS[-1]
+        assert len(block_ids) > 1
+        assert any(0 in ids for ids in block_ids)
 
     assert written.outputs[0].token_ids == hit.outputs[0].token_ids
     got, want = written.outputs[0].logprobs, hit.outputs[0].logprobs
