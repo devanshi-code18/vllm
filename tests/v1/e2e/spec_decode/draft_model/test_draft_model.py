@@ -104,6 +104,55 @@ def test_draft_model_correctness(args: ArgsTest, enforce_eager: bool, vllm_runne
     assert_draft_model_correctness(args, vllm_runner)
 
 
+@pytest.mark.parametrize(
+    "spec_config",
+    [
+        {"method": "ngram", "prompt_lookup_max": 4, "prompt_lookup_min": 2},
+        {
+            "method": "draft_model",
+            "model": "Qwen/Qwen3-0.6B",
+            "draft_sample_method": "probabilistic",
+        },
+    ],
+    ids=["ngram", "draft_model"],
+)
+@single_gpu_only
+def test_coupled_verification_matches_non_speculative_sampling(
+    spec_config: dict[str, Any], monkeypatch: pytest.MonkeyPatch, vllm_runner
+):
+    """Seeded sampling emits the same tokens with speculation on and off.
+
+    Batch invariance makes the verification logits equal the decode logits, so
+    the outputs must match exactly.
+    """
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    messages = get_messages("test_prompts", 32)
+    params = [
+        SamplingParams(temperature=1.0, seed=i, max_tokens=64)
+        for i in range(len(messages))
+    ]
+    coupled = {
+        **spec_config,
+        "num_speculative_tokens": 3,
+        "rejection_sample_method": "coupled",
+    }
+    token_ids = []
+    for config in (None, coupled):
+        with vllm_runner(
+            "Qwen/Qwen3-1.7B",
+            speculative_config=config,
+            max_model_len=2048,
+            gpu_memory_utilization=0.5,
+            disable_log_stats=False,
+        ) as runner:
+            llm = runner.get_llm()
+            outputs = llm.chat(messages, params, use_tqdm=False)
+            if config is not None:
+                assert compute_acceptance_rate(llm.get_metrics()) > 0
+        token_ids.append([list(o.outputs[0].token_ids) for o in outputs])
+    assert token_ids[0] == token_ids[1]
+
+
 @single_gpu_only
 def test_draft_model_realistic_example(vllm_runner):
     args = ArgsTest(

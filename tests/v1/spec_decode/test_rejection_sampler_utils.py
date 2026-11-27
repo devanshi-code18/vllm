@@ -1364,6 +1364,7 @@ def test_verify_rejects_unproposed_drafts():
     rejection_sampler.num_speculative_steps = K
     rejection_sampler.synthetic_conditional_rates = None
     rejection_sampler.use_block_verification = True
+    rejection_sampler.use_coupled_verification = False
     rejection_sampler.fly_window_size = 0
     rejection_sampler.fly_entropy_threshold = 0.3
     rejection_sampler.fly_entropy_top_k = 3
