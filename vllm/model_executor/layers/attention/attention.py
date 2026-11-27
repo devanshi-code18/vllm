@@ -630,6 +630,22 @@ class Attention(nn.Module, AttentionLayerBase):
             )
         return output.view(-1, hidden_size)
 
+    def write_kv(
+        self, key: torch.Tensor, value: torch.Tensor, slot_mapping: torch.Tensor
+    ) -> None:
+        """Write K/V for tokens at `slot_mapping` into this layer's paged
+        cache, quantized with the layer's own KV-cache dtype and scales, as
+        the forward pass writes them."""
+        if self.kv_sharing_target_layer_name is not None:
+            return
+        self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+            self,
+            key.view(-1, self.num_kv_heads, self.head_size),
+            value.view(-1, self.num_kv_heads, self.head_size_v),
+            self.kv_cache,
+            slot_mapping,
+        )
+
     def extra_repr(self) -> str:
         s = f"head_size={self.impl.head_size}"  # type: ignore
         s += f", num_heads={self.impl.num_heads}"  # type: ignore

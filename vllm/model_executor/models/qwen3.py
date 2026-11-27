@@ -23,7 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen3 model compatible with HuggingFace weights."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
 
 import torch
@@ -38,6 +38,10 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention.encoder_only_attention import (
     Attention,
     EncoderOnlyAttention,
+)
+from vllm.model_executor.layers.kv_from_layer_inputs import (
+    KVWriteTarget,
+    write_decoder_kv,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -61,6 +65,7 @@ from .interfaces import (
     LocalArgmaxMixin,
     SupportsEagle,
     SupportsEagle3,
+    SupportsKVFromLayerInputs,
     SupportsLoRA,
     SupportsPP,
     SupportsQuant,
@@ -224,12 +229,28 @@ class Qwen3Attention(nn.Module):
         if self.qk_norm:
             q_by_head = self.q_norm(q.view(*q.shape[:-1], -1, self.head_dim))
             q = q_by_head.view(q.shape)
-            k_by_head = self.k_norm(k.view(*k.shape[:-1], -1, self.head_dim))
-            k = k_by_head.view(k.shape)
+            k = self._norm_k(k)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _norm_k(self, k: torch.Tensor) -> torch.Tensor:
+        k_by_head = self.k_norm(k.view(*k.shape[:-1], -1, self.head_dim))
+        return k_by_head.view(k.shape)
+
+    def kv_from_normed_input(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`forward`'s K (normed, rotated) and V for normed layer inputs. Q is
+        computed and dropped: the full QKV GEMM keeps the K/V bits of
+        `forward`, where a narrower GEMM may pick another kernel."""
+        qkv, _ = self.qkv_proj(hidden_states)
+        _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.qk_norm:
+            k = self._norm_k(k)
+        k, _ = self.rotary_emb(positions, k)
+        return k, v
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -431,6 +452,15 @@ class Qwen3Model(nn.Module, EagleModelMixin):
 
         return hidden_states
 
+    def write_kv_from_layer_inputs(
+        self,
+        layer_inputs: Sequence[torch.Tensor],
+        targets: Mapping[str, KVWriteTarget],
+    ) -> None:
+        write_decoder_kv(
+            self.layers, self.start_layer, self.end_layer, layer_inputs, targets
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
@@ -444,6 +474,7 @@ class Qwen3ForCausalLM(
     SupportsEagle,
     SupportsEagle3,
     SupportsQuant,
+    SupportsKVFromLayerInputs,
 ):
     hf_to_vllm_mapper = Qwen3Model.hf_to_vllm_mapper
     packed_modules_mapping = {
@@ -513,6 +544,13 @@ class Qwen3ForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+
+    def write_kv_from_layer_inputs(
+        self,
+        layer_inputs: Sequence[torch.Tensor],
+        targets: Mapping[str, KVWriteTarget],
+    ) -> None:
+        self.model.write_kv_from_layer_inputs(layer_inputs, targets)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

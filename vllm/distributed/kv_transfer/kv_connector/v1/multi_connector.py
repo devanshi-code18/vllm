@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
+    from vllm.v1.worker.kv_from_layer_inputs import KVFromLayerInputsWriter
 
 logger = init_logger(__name__)
 
@@ -324,6 +325,12 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         for c in self._connectors:
             c.register_kv_caches(kv_caches)
+
+    def register_kv_from_layer_inputs_writer(
+        self, writer: "KVFromLayerInputsWriter"
+    ) -> None:
+        for c in self._connectors:
+            c.register_kv_from_layer_inputs_writer(writer)
 
     def unregister_kv_caches(self) -> None:
         for c in self._connectors:

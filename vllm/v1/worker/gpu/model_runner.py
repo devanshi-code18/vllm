@@ -193,6 +193,10 @@ from vllm.v1.worker.gpu.ubatch_utils import (
     UBatchState,
     maybe_build_ubatch_runner,
 )
+from vllm.v1.worker.kv_from_layer_inputs import (
+    KVFromLayerInputsWriter,
+    create_kv_from_layer_inputs_writer,
+)
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.replayssm_utils import get_replayssm_block_copy_tensors
 from vllm.v1.worker.utils import (
@@ -376,6 +380,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # KV Connector if configured.
         self.kv_connector: KVConnector = NO_OP_KV_CONNECTOR
+        self.kv_from_layer_inputs_writer: KVFromLayerInputsWriter | None = None
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
@@ -704,6 +709,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        self.kv_from_layer_inputs_writer = create_kv_from_layer_inputs_writer(
+            self.model, self.vllm_config, kv_cache_config, self.device
+        )
         self.extensible_kv_cache: ExtensibleKVCache | None = None
         if extensible:
             self.extensible_kv_cache = ExtensibleKVCache(
@@ -889,7 +897,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
             self.kv_caches_by_layer = kv_caches_dict
-            self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+            self.kv_connector = get_kv_connector(
+                self.vllm_config, kv_caches_dict, self.kv_from_layer_inputs_writer
+            )
 
             # AuxOutput connector requires resolved kv_cache_config.
             if self.vllm_config.aux_output_config.enabled:

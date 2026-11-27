@@ -592,7 +592,9 @@ def extend_kv_cache(
                 forward_context
             )
     runner.kv_connector = get_kv_connector(
-        runner.vllm_config, runner.kv_caches_by_layer
+        runner.vllm_config,
+        runner.kv_caches_by_layer,
+        runner.kv_from_layer_inputs_writer,
     )
 
 

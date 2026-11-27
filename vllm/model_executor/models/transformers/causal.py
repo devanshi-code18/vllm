@@ -30,12 +30,13 @@ from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneratio
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 
 from .base import Base
+from .kv_from_layer_inputs import KVFromLayerInputsMixin
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
-class CausalMixin(VllmModelForTextGeneration, Base):
+class CausalMixin(VllmModelForTextGeneration, KVFromLayerInputsMixin, Base):
     embedding_modules = {"lm_head": "output_embeddings"}
 
     def __init__(self, *, vllm_config: "VllmConfig", prefix: str = ""):

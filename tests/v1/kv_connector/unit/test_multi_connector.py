@@ -319,6 +319,15 @@ def test_multi_connector_forwards_mem_pool_context(mc: MultiConnector):
     provider.get_mem_pool_context.assert_called_once_with()
 
 
+def test_multi_connector_forwards_kv_from_layer_inputs_writer(mc: MultiConnector):
+    children = [MagicMock(spec_set=KVConnectorBase_V1) for _ in range(2)]
+    mc._connectors = children
+    writer = MagicMock()
+    mc.register_kv_from_layer_inputs_writer(writer)
+    for child in children:
+        child.register_kv_from_layer_inputs_writer.assert_called_once_with(writer)
+
+
 def test_multi_connector_rejects_multiple_mem_pool_contexts(mc: MultiConnector):
     providers = [
         MagicMock(spec_set=KVConnectorBase_V1),
