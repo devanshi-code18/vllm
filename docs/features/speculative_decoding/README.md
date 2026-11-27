@@ -183,7 +183,7 @@ only apply to model-based methods such as `draft_model`, `mtp`, `eagle3`, and
 | `draft_enable_eplb` | `boolean` | `true` | Enable EPLB for the draft when target EPLB is enabled. Set to `false` to disable EPLB for the draft. |
 | `max_model_len` | `integer >= 1` | `None` | Maximum context length for the draft model. A draft limit below the target's may also lower the engine's `max_model_len`. |
 | `parallel_drafting` | `boolean` | `null` | Deprecated and has no effect. `dflash` and `dspark` always draft in parallel, and no other method supports it. |
-| `rejection_sample_method` | `string` | `standard` | `standard`, `synthetic`, `block`, or the lossy `fly` verifier. |
+| `rejection_sample_method` | `string` | `standard` | `standard`, `synthetic`, `block`, `coupled` (see [Speculation-invariant sampling](#speculation-invariant-sampling)), or the lossy `fly` verifier. |
 | `draft_sample_method` | `string` | `greedy` | `greedy` uses target-only acceptance for random requests; `probabilistic` retains the full draft distribution for probability-ratio acceptance. |
 | `synthetic_acceptance_rates` | `list[float]` | `None` | Per-position unconditional acceptance rates for `synthetic` rejection sampling. Each entry in `[0, 1]`; length must equal `num_speculative_tokens`; must be non-increasing. |
 | `synthetic_acceptance_length` | `float` | `None` | Target mean acceptance length for `synthetic`; in `[1, num_speculative_tokens + 1]`. Mutually exclusive with `synthetic_acceptance_rates`. |
@@ -266,6 +266,27 @@ vllm serve <target-model> \
 ## Speculative Decoding with Pipeline Parallelism
 
 With pipeline parallelism (`pipeline_parallel_size > 1`), the draft model runs as a whole model on the last pipeline stage, as it would at `pipeline_parallel_size=1`. A custom `VLLM_PP_LAYER_PARTITION` applies only to the target model.
+
+## Speculation-invariant sampling
+
+With `rejection_sample_method="coupled"`, a seeded request returns the same
+tokens with speculative decoding on or off, with any drafter and any
+`num_speculative_tokens`. The verifier draws every row with the target's own
+seeded sampler, exactly as non-speculative decoding would, and accepts a draft
+token only if it equals that sample. Drafts change how many tokens a step
+emits, never which ones, so the output follows the target distribution.
+
+```bash
+vllm serve Qwen/Qwen3-8B --speculative-config '{"method": "draft_model", "model": "Qwen/Qwen3-0.6B", "num_speculative_tokens": 3, "rejection_sample_method": "coupled", "draft_sample_method": "probabilistic"}'
+```
+
+- Bitwise-equal outputs also need bitwise-equal logits for a verification
+  step and a decode step: set `VLLM_BATCH_INVARIANT=1`.
+- With `draft_sample_method="greedy"` (and n-gram drafts), acceptance is the
+  same as the standard verifier's. With `"probabilistic"`, drafts are sampled
+  with the target's noise (Gumbel coupling, [Daliri et al.](https://arxiv.org/abs/2408.07978)),
+  which accepts slightly less often than probability-ratio rejection sampling.
+- Requests without a seed are still sampled exactly, but are not reproducible.
 
 ## Lossless guarantees of Speculative Decoding
 
