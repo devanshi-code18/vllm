@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
+    from vllm.v1.worker.kv_from_layer_inputs import KVFromLayerInputsWriter
 
 # s_tensor_list, d_tensor_list, s_indices, d_indices, direction
 CopyBlocksOp = Callable[
@@ -336,6 +337,22 @@ class KVConnectorBase_V1(ABC):
 
         Args:
             kv_caches: dictionary of layer names, kv cache
+
+        """
+        return
+
+    def register_kv_from_layer_inputs_writer(
+        self, writer: "KVFromLayerInputsWriter"
+    ) -> None:
+        """Called on each worker after `register_kv_caches` when the served
+        model can write its KV cache from per-layer inputs
+        (`SupportsKVFromLayerInputs`). A connector that loads such inputs
+        keeps the writer and calls `writer.write` from `start_load_kv`. Like
+        `register_kv_caches`, it can be called again when the worker
+        re-registers its KV caches (e.g. after the KV cache is extended).
+
+        Args:
+            writer: this worker's writer.
 
         """
         return

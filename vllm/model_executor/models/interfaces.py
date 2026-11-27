@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from vllm.inputs import PromptType, TokensPrompt
     from vllm.lora.model_manager import LoRAModelManager
     from vllm.model_executor.layers.fused_moe import MoERunner
+    from vllm.model_executor.layers.kv_from_layer_inputs import KVWriteTarget
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
     from vllm.model_executor.layers.mamba.mamba_utils import (
         MambaStateCopyFunc,
@@ -1257,6 +1258,58 @@ class SupportsMambaPrefixCaching(Protocol):
         """Map legacy copy functions to each requested Mamba backend."""
         copy_funcs = cls.get_mamba_state_copy_func()
         return {mamba_type: copy_funcs for mamba_type in mamba_types}
+
+
+@runtime_checkable
+class SupportsKVFromLayerInputs(Protocol):
+    """The interface for models that can write their KV cache from per-layer
+    inputs instead of running the prompt.
+
+    `layer_inputs[i]` is the residual stream entering decoder layer `i` (layer
+    0: the scaled input embeddings), as a normal forward pass holds it. Each
+    attention layer turns its input into K/V with its own input norm, K/V
+    projection, K norm, RoPE and KV-cache scales, and writes the tokens and
+    slots `targets[layer_name]` names. Attention outputs and MLPs are not
+    computed.
+
+    !!! note
+        Experimental.
+    """
+
+    supports_kv_from_layer_inputs: ClassVar[Literal[True]] = True
+
+    kv_from_layer_inputs_dtype: ClassVar[torch.dtype | None] = None
+    """The dtype layer inputs must have to reproduce the forward exactly
+    (None: the model dtype); the writer rejects others."""
+
+    def kv_from_layer_inputs_unsupported_reason(self) -> str | None:
+        """Why this model instance cannot write its KV cache from layer
+        inputs, or None."""
+        return None
+
+    def write_kv_from_layer_inputs(
+        self,
+        layer_inputs: Sequence[torch.Tensor],
+        targets: Mapping[str, "KVWriteTarget"],
+    ) -> None: ...
+
+
+@overload
+def supports_kv_from_layer_inputs(
+    model: type[object],
+) -> TypeIs[type[SupportsKVFromLayerInputs]]: ...
+
+
+@overload
+def supports_kv_from_layer_inputs(
+    model: object,
+) -> TypeIs[SupportsKVFromLayerInputs]: ...
+
+
+def supports_kv_from_layer_inputs(
+    model: type[object] | object,
+) -> TypeIs[type[SupportsKVFromLayerInputs]] | TypeIs[SupportsKVFromLayerInputs]:
+    return getattr(model, "supports_kv_from_layer_inputs", False)
 
 
 @runtime_checkable
