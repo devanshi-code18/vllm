@@ -27,6 +27,7 @@ vllm serve Qwen/Qwen3-14B --tensor-parallel-size 2 \
 `kv_connector_extra_config`:
 
 - `store` (required): the store directory, readable by the scheduler and every worker.
+- `load_async` (default `true`): load documents in the background. A request waits for its document while the other requests keep running; with `false`, the step that schedules the request loads it and the other requests in that step wait for the load.
 - `require_cache_salt` (default `true`): load only for requests that set `cache_salt`. Translated KV is approximate, so give translated requests a salt that only translated requests use: their blocks then never serve requests that prefill the same tokens themselves.
 
 ## Request
@@ -67,5 +68,4 @@ One directory per document:
 
 - Models with a single KV cache group only: full-attention models, or models whose sliding-window layers run with the hybrid KV cache manager disabled (the default with this connector). MLA, Mamba and gated-delta layers are not supported.
 - No speculative decoding with a draft model (EAGLE, MTP, `draft_model` and the like): the store holds only the served model's K/V. `ngram` and `suffix` work.
-- Loads are synchronous: the step that loads a document waits for it, and so do the other requests in that step.
-- If a document's file disappears between scheduling and loading, the blocks that load would have written are reported as failed and `kv_load_failure_policy` applies. Keep the default policy `fail`: with async scheduling, `recompute` hangs the engine on a failed load ([#45138](https://github.com/vllm-project/vllm/issues/45138)).
+- If a document's file disappears between scheduling and loading, `kv_load_failure_policy` applies to that request (with `load_async: false`, to the blocks the load would have written). With `load_async: false` and async scheduling, `recompute` hangs the engine on a failed load ([#45138](https://github.com/vllm-project/vllm/issues/45138)): keep `load_async` on or the default policy `fail`.

@@ -51,6 +51,9 @@ def _publish(store, key="doc0", tokens=DOCUMENT, heads=HEADS):
 
 
 def _config(store, **extra):
+    # Most tests check what a request loads, so they load in the step that
+    # schedules it; test_document_loads_in_background covers the default.
+    extra.setdefault("load_async", False)
     return create_vllm_config(
         block_size=BLOCK_SIZE,
         max_num_batched_tokens=256,
@@ -249,6 +252,68 @@ def _kv_cache_config(num_groups=1):
             make_kv_cache_group([f"layer.{i}"], spec) for i in range(num_groups)
         ],
     )
+
+
+def _worker(config, kv_cache_config):
+    worker = SpeculativeEncodingConnector(
+        config, KVConnectorRole.WORKER, kv_cache_config
+    )
+    worker.register_kv_caches({"layer.0": torch.zeros(1)})
+    return worker
+
+
+def _forward_context():
+    return ForwardContext(no_compile_layers={}, attn_metadata={}, slot_mapping={})
+
+
+@pytest.mark.parametrize("delete", [False, True])
+def test_document_loads_in_background(tmp_path, delete):
+    """By default a request waits for its document while other requests keep
+    running, and is scheduled once every worker reports the load done; a
+    failed load fails that request only."""
+    _publish(tmp_path)
+    config = _config(tmp_path, load_async=True)
+    scheduler = create_scheduler(config)
+    running = _request([1, 2, 3], document=None, request_id="running")
+    output, _, _ = _schedule_one(scheduler, running)
+    scheduler.update_from_output(output, create_model_runner_output([running]))
+
+    loading = _request(DOCUMENT + [7, 8], request_id="loading")
+    scheduler.add_request(loading)
+    output = scheduler.schedule()
+    meta = output.kv_connector_metadata
+    assert isinstance(meta, SpeculativeEncodingConnectorMetadata)
+    (load,) = meta.loads
+    assert loading.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert "loading" not in output.num_scheduled_tokens
+    assert output.num_scheduled_tokens["running"] == 1
+    assert (load.start, load.end) == (0, len(DOCUMENT))
+
+    if delete:
+        (tmp_path / "doc0" / "kv.safetensors").unlink()
+    worker = _worker(config, scheduler.kv_cache_config)
+    worker.bind_connector_metadata(output.kv_connector_metadata)
+    worker.start_load_kv(_forward_context())
+    worker.shutdown()
+    results = worker.get_transfer_results(set())
+    assert results.finished_recving == {"loading"}
+    assert results.failed_recving == ({"loading"} if delete else set())
+    assert worker.get_block_ids_with_load_errors() == set()
+
+    scheduler.update_from_output(
+        output,
+        create_model_runner_output(
+            [running],
+            finished_recving=results.finished_recving,
+            failed_recving=results.failed_recving,
+        ),
+    )
+    output = scheduler.schedule()
+    if delete:
+        assert loading.status == RequestStatus.FINISHED_ERROR
+    else:
+        # Only the last prompt tokens are computed.
+        assert output.num_scheduled_tokens["loading"] == 2
 
 
 def test_refuses_several_kv_cache_groups(tmp_path):
