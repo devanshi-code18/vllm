@@ -79,3 +79,21 @@ def test_packed_token_ids_match_lmcache_codec():
     token_ids = [0, 1, 255, 256, 151_643, 2**31 - 1]
     assert _pack_token_ids(TokenBuffer(token_ids)) == pack_token_ids(token_ids)
     assert _pack_token_ids(token_ids) == pack_token_ids(token_ids)
+
+
+def test_store_key_keeps_kv_provenances_apart():
+    """KV loaded under a provenance must not serve other requests from LMCache."""
+
+    def salt(cache_salt: str | None, kv_provenance: str | None) -> str:
+        request = Request(
+            "r", [1, 2, 3], SamplingParams(max_tokens=1), None, cache_salt=cache_salt
+        )
+        request.kv_provenance = kv_provenance
+        return LMCacheMPRequestTracker(request).cache_salt
+
+    assert salt(None, None) == "" and salt("s", None) == "s"
+    tagged = salt("s", "translated:a")
+    salts = {tagged, salt(None, "translated:a"), salt("s", "translated:b")}
+    salts |= {salt(s, None) for s in ("", "s", tagged)}
+    assert len(salts) == 6
+    assert all(s.isprintable() for s in salts)

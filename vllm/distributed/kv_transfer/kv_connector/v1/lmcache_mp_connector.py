@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import enum
+import json
 import os
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, fields
@@ -211,6 +212,16 @@ class LMCacheMPRequestState(enum.Enum):
     READY = enum.auto()
 
 
+def _lmcache_salt(request: "Request") -> str:
+    """The request's `cache_salt` with its KV provenance folded in. Salts of
+    requests without one stay as they are; the encoding keeps every
+    (salt, provenance) pair distinct."""
+    salt = request.cache_salt or ""
+    if request.kv_provenance is None and not salt.startswith("kvp:"):
+        return salt
+    return "kvp:" + json.dumps([salt, request.kv_provenance])
+
+
 @dataclass
 class LMCacheMPRequestTracker:
     # NOTE: this class used vLLM data structures, should be part of
@@ -246,7 +257,7 @@ class LMCacheMPRequestTracker:
 
     def __init__(self, request: "Request"):
         self.request_id = request.request_id
-        self.cache_salt: str = request.cache_salt or ""
+        self.cache_salt: str = _lmcache_salt(request)
         self.all_token_ids = request._all_token_ids
         self.allocated_block_ids = []
         self.num_stored_blocks = 0
