@@ -26,7 +26,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.inputs import TokensPrompt
 from vllm.platforms import current_platform
 
-MODELS = ["Qwen/Qwen3-0.6B"]
+MODELS = [
+    "Qwen/Qwen3-0.6B",
+    # LlamaForCausalLM, served by the Transformers modeling backend.
+    "HuggingFaceTB/SmolLM2-135M-Instruct",
+]
 PREFIX_TOKENS = 512
 
 
@@ -107,11 +111,16 @@ def _capture_layer_inputs(model, captured: dict, num_tokens: int):
     """Record the input of every decoder layer for positions < num_tokens."""
 
     def hook(idx):
-        def record(module, args):
+        def record(module, args, kwargs):
             if not captured["active"]:
                 return
-            positions, hidden, residual = args[:3]
-            x = hidden if residual is None else hidden + residual
+            if len(args) >= 3:  # native: (positions, hidden_states, residual)
+                positions, hidden, residual = args[:3]
+                x = hidden if residual is None else hidden + residual
+            else:  # Transformers backend: HF decoder layer
+                hidden = args[0] if args else kwargs["hidden_states"]
+                positions = kwargs["position_ids"].reshape(-1)
+                x = hidden.reshape(-1, hidden.shape[-1])
             keep = positions < num_tokens
             buf = captured.setdefault(
                 idx, torch.zeros(num_tokens, x.shape[-1], dtype=x.dtype)
@@ -120,8 +129,10 @@ def _capture_layer_inputs(model, captured: dict, num_tokens: int):
 
         return record
 
-    for idx, layer in enumerate(model.model.layers):
-        layer.register_forward_pre_hook(hook(idx))
+    if (layers := getattr(model, "_decoder_layers", None)) is None:
+        layers = model.model.layers
+    for idx, layer in enumerate(layers):
+        layer.register_forward_pre_hook(hook(idx), with_kwargs=True)
 
 
 @pytest.mark.skipif(

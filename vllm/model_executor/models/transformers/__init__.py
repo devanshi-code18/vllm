@@ -23,6 +23,10 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from vllm.model_executor.models.transformers.base import VLLM_ATTN_ATTR
 from vllm.model_executor.models.transformers.causal import CausalMixin
+from vllm.model_executor.models.transformers.kv_from_layer_inputs import (
+    VLLM_KV_ONLY_ATTN_IMPL,
+    vllm_kv_only_attention_forward,
+)
 from vllm.model_executor.models.transformers.legacy import LegacyMixin
 from vllm.model_executor.models.transformers.moe import MoEMixin
 from vllm.model_executor.models.transformers.mtp import MTPMixin
@@ -127,6 +131,7 @@ def vllm_mla_attention_forward(
 
 ALL_ATTENTION_FUNCTIONS.register("vllm", vllm_attention_forward)
 ALL_ATTENTION_FUNCTIONS.register("vllm_mla", vllm_mla_attention_forward)
+ALL_ATTENTION_FUNCTIONS.register(VLLM_KV_ONLY_ATTN_IMPL, vllm_kv_only_attention_forward)
 
 
 # Text only models
