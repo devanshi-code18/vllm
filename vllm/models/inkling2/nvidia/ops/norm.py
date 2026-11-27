@@ -112,6 +112,7 @@ def qr_clip_rel_tokens(
     HAS_TAU: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_E: tl.constexpr,
+    ALIGNED: tl.constexpr,
 ):
     """For tokens `[t0, t0 + num_t)`: per-head L2 clipping of `q * q_scale`
     (`chunk < 0`) or of `r * r_scale` and the `BLOCK_E` columns `chunk`
@@ -123,7 +124,8 @@ def qr_clip_rel_tokens(
     128-token query tiles: `E + 256` columns per head, column `c` holding
     key `c + (n_block_max - 10) * 128`, where `n_block_max` bounds the key
     blocks of the token's tile, plus the table's padding (keys right of the
-    diagonal, and for window layers those past the extent, are -inf)."""
+    diagonal, and for window layers those past the extent, are -inf). With
+    `ALIGNED`, a tile is the token's block of 128 positions."""
     E_PAD: tl.constexpr = E + 256
     heads = tl.arange(0, BLOCK_H)[:, None]
     h_mask = heads < H
@@ -152,11 +154,15 @@ def qr_clip_rel_tokens(
             q_len = tl.load(CuSeqlensQ + seq + 1) - q_start
             q_idx = t - q_start
             pos = tl.load(SeqLens + seq) - q_len + q_idx
-            tile_end = tl.minimum((q_idx // 128 + 1) * 128, q_len)
+            if ALIGNED:
+                tile_blocks = pos // 128 + 1
+            else:
+                tile_end = tl.minimum((q_idx // 128 + 1) * 128, q_len)
+                tile_blocks = tl.cdiv(pos - q_idx + tile_end, 128)
             # Column of the diagonal key (distance 0), in [E + 1, E + 255] for a
             # real token. CUDA-graph padding rows (seq_idx 0, q_idx past the
             # request) would land outside and read before the shifted table.
-            diag = pos + E_PAD - tl.cdiv(pos - q_idx + tile_end, 128) * 128
+            diag = pos + E_PAD - tile_blocks * 128
             diag = tl.minimum(tl.maximum(diag, E + 1), E_PAD - 1)
             tau = tl.load(Tau + t) if HAS_TAU else 1.0
             r = _l2_clip(

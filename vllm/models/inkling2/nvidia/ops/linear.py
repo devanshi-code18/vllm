@@ -5,6 +5,7 @@ reference `linear` with fp32 accumulation in ordered 1024-wide K groups."""
 
 import torch
 
+from vllm import envs
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import is_flashinfer_autotuning
@@ -29,10 +30,13 @@ def linear(
     if use_sm12x_bf16_ll_gemm(x, weight):
         return sm12x_bf16_ll_gemm(x, weight)
     # Autotuning would profile the CuTe DSL kernels past their 32-row limit.
+    # Batch-invariant mode keeps every M on the batch-invariant matmul: the
+    # CuTe DSL kernels pick a split-K tactic per M bucket.
     if (
         x.shape[0] > LOW_M_MAX_TOKENS
         or is_flashinfer_autotuning()
         or not use_sm100_kernels()
+        or envs.VLLM_BATCH_INVARIANT
     ):
         return torch.nn.functional.linear(x, weight)
     from flashinfer import mm_bf16

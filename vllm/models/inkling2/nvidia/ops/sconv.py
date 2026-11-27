@@ -561,6 +561,7 @@ def _attn_prologue_kernel(
     BLOCK_E: tl.constexpr,
     QR_TOKENS: tl.constexpr,
     FUSE_QR: tl.constexpr,
+    ALIGNED: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
     if launch_pdl:
@@ -602,6 +603,7 @@ def _attn_prologue_kernel(
                 HAS_TAU,
                 BLOCK_HQ,
                 BLOCK_E,
+                ALIGNED,
             )
     else:
         _kv_conv_tile(
@@ -676,6 +678,7 @@ def _qr_rel_kernel(
     BLOCK_HQ: tl.constexpr,
     BLOCK_E: tl.constexpr,
     QR_TOKENS: tl.constexpr,
+    ALIGNED: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
     # Runs alongside the K/V conv launch (`_attn_prologue_kernel` without
@@ -711,6 +714,7 @@ def _qr_rel_kernel(
         HAS_TAU,
         BLOCK_HQ,
         BLOCK_E,
+        ALIGNED,
     )
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
@@ -879,6 +883,7 @@ def attention_prologue(
     rel_threshold: float,
     norm_eps: float,
     clip_eps: float = 1e-6,
+    aligned_tiles: bool = False,
 ) -> None:
     """Attention input processing in one launch.
 
@@ -887,9 +892,11 @@ def attention_prologue(
     are rounded, then scaled by the fp32 per-token `tau`). `rel_proj` is
     the `shift_rel_proj` table; the logits come out sheared as tml_fa4 reads
     them for a varlen launch over all tokens (`(T + 128, HQ, extent +
-    256)`) from the per-request `cu_seqlens_q` and `seq_lens`. Runs the
-    K/V short convolutions, clips K, RMS-normalizes V and inserts both into
-    the KV cache (tokens with `kv_slot_mapping < 0` skip the write).
+    256)`) from the per-request `cu_seqlens_q` and `seq_lens` (with
+    `aligned_tiles`, for query tiles that each cover one block of 128
+    positions). Runs the K/V short convolutions, clips K, RMS-normalizes V
+    and inserts both into the KV cache (tokens with `kv_slot_mapping < 0`
+    skip the write).
 
     `q` `(T, HQ, D)`, `r` `(T, HQ, D_rel)` and `k`/`v`
     `(T, H * D)` may be row-strided; K and V occupy `[0, D)` and
@@ -997,6 +1004,7 @@ def attention_prologue(
         BLOCK_E=block_e,
         QR_TOKENS=triton.cdiv(block_t, num_heads),
         FUSE_QR=not qr_tokens,
+        ALIGNED=aligned_tiles,
         num_warps=4,
         enable_fp_fusion=False,
         launch_pdl=current_platform.is_arch_support_pdl(),
@@ -1029,6 +1037,7 @@ def attention_prologue(
             BLOCK_HQ=max(triton.next_power_of_2(num_q_heads), 16),
             BLOCK_E=block_e,
             QR_TOKENS=qr_tokens,
+            ALIGNED=aligned_tiles,
             num_warps=4,
             enable_fp_fusion=False,
             launch_pdl=current_platform.is_arch_support_pdl(),

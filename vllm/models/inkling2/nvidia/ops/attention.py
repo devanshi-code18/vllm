@@ -54,6 +54,10 @@ def plan_attention(
     """
     if is_local:
         return 1, True
+    if envs.VLLM_BATCH_INVARIANT:
+        # One split: a row sums its keys in one order whatever shares the
+        # launch (the split count follows the batch's tokens and lengths).
+        return 1, False
     num_tokens = int(query_lens.sum())
     if num_tokens * num_kv_heads < 512:
         return max(1, min(128, 8192 // num_tokens)), True
@@ -400,7 +404,10 @@ def plan_decode_attention(
         return 0
     if envs.VLLM_BATCH_INVARIANT:
         # One split: every request reads its keys in one order, as in prefill.
-        return 1
+        # SM100 prefills on FA4, whose bits this kernel does not reproduce, so
+        # there every query takes FA4 (else a prompt's last tokens would switch
+        # kernels on a prefix-cache hit).
+        return 0 if use_sm100_kernels() else 1
     work = num_reqs * num_kv_heads
     num_sms = num_compute_units()
     if is_local:

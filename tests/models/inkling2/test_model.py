@@ -197,10 +197,6 @@ def _redraw_attention(model: torch.nn.Module) -> None:
             param.normal_(std=param.shape[-1] ** -0.5, generator=generator)
 
 
-@pytest.mark.skipif(
-    not current_platform.is_device_capability(80),
-    reason="Inkling2 batch invariance is validated on A100",
-)
 @pytest.mark.parametrize("prefix_caching", [False, True])
 def test_tiny_looped_model_batch_invariant(
     tmp_path, monkeypatch, enable_pickle, prefix_caching
@@ -212,6 +208,10 @@ def test_tiny_looped_model_batch_invariant(
     tiling from the batch). With prefix caching, a request whose prompt is
     cached prefills only its last few tokens, and its attention must still
     sum the keys in the order of a full prefill."""
+    from vllm.models.inkling2.nvidia.sconv import supports_batch_invariance
+
+    if not supports_batch_invariance():
+        pytest.skip("Inkling2 batch invariance is validated on A100, H100, B200")
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
     (tmp_path / "config.json").write_text(json.dumps(TINY_LOOP_CONFIG))

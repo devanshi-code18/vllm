@@ -34,14 +34,18 @@ from .ops.seq_parallel import SeqParallel
 K_STREAM, V_STREAM, ATTN_STREAM, MLP_STREAM = range(4)
 
 
+def supports_batch_invariance() -> bool:
+    """Inkling2 is batch invariant where validated: A100 (SM80), H100 (SM90)
+    and B200 (SM100). Other GPUs run other attention, MoE and GEMM kernels."""
+    return any(current_platform.is_device_capability(c) for c in (80, 90, 100))
+
+
 class Inkling2SconvBackend(InklingSconvBackend):
     """The conv-state cache's metadata; it runs no kernel."""
 
     @classmethod
     def supports_batch_invariance(cls) -> bool:
-        # Inkling2 is batch invariant where validated (A100); other GPUs run
-        # other attention, MoE and GEMM kernels.
-        return current_platform.is_device_capability(80)
+        return supports_batch_invariance()
 
 
 class Inkling2ConvState(InklingConvState):

@@ -144,7 +144,7 @@ Batch invariance has been tested and verified on the following models:
 - **Granite MoE SWA**: `ibm-granite/granite-swash-3b-a600m` (MoE + sliding-window attention; FLASH_ATTN and TRITON_ATTN backends; FLEX_ATTENTION and decode-vs-prefill test excluded due to per-layer SWA KV window differences)
 - **Granite SWA**: `ibm-granite/granite-swash-2b` (sliding-window attention; FLASH_ATTN and TRITON_ATTN backends)
 - **LFM2 (MoE)**: `LiquidAI/LFM2-8B-A1B`
-- **Inkling 2**: `thinkingmachines/Inkling-2-Mini` (A100, TP=1; three-pass loop and MoE; with DSpark speculative decoding, greedy outputs match target-only decoding)
+- **Inkling 2**: `thinkingmachines/Inkling-2-Mini` (A100, H100 and B200, TP=1; three-pass loop and MoE; with DSpark speculative decoding, greedy outputs match target-only decoding)
 
 Other models may also work, but these have been explicitly validated. If you encounter issues with a specific model, please report them on the [GitHub issue tracker](https://github.com/vllm-project/vllm/issues/new/choose).
 
