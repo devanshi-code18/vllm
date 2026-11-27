@@ -17,10 +17,13 @@ streaming and tensor or pipeline parallelism. Each tensor-parallel rank reads
 only its own KV heads.
 """
 
+import contextlib
 import json
 import os
+import queue
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -32,6 +35,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVConnectorTransferResults,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding.reader import (  # noqa: E501
     StagedReader,
@@ -91,6 +95,10 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
         require_cache_salt: Load only for requests with a `cache_salt`
             (default True). Use a salt only for translated requests, so their
             blocks never serve requests that prefill the same tokens.
+        load_async: Load documents in the background (default True): a request
+            waits for its document while the other requests keep running.
+            With false, the step that schedules the request loads it, and the
+            other requests in that step wait for the load.
     """
 
     def __init__(
@@ -111,6 +119,9 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
         self._store = Path(store)
         self._require_salt = bool(
             self._kv_transfer_config.get_from_extra_config("require_cache_salt", True)
+        )
+        self._load_async = bool(
+            self._kv_transfer_config.get_from_extra_config("load_async", True)
         )
         # A failed load is reported by block id, which the scheduler can map
         # back to requests only with a single KV cache group.
@@ -155,6 +166,11 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
         self._dtype = model_config.dtype
         self._reader = StagedReader()
         self._failed_block_ids: set[int] = set()
+        self._layers: dict[str, Any] | None = None
+        # Background loads run one at a time on their own thread and stream.
+        self._loader: ThreadPoolExecutor | None = None
+        self._stream: torch.Stream | None = None
+        self._done: queue.SimpleQueue[tuple[DocumentLoad, bool]] = queue.SimpleQueue()
 
     # ==============================
     # Scheduler-side methods
@@ -236,7 +252,12 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
         document = self._match(request)
         if document is None:
             return 0, False
-        return max(0, self._num_tokens(request, document) - num_computed_tokens), False
+        num_tokens = max(0, self._num_tokens(request, document) - num_computed_tokens)
+        return num_tokens, self._load_async and num_tokens > 0
+
+    def may_load_async(self, request: "Request") -> bool:
+        spec = (request.kv_transfer_params or {}).get(PARAMS_KEY)
+        return self._load_async and isinstance(spec, dict)
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
@@ -246,6 +267,9 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
         document = self._matches[request.request_id]
         assert document is not None
         end = self._num_tokens(request, document)
+        # A background load starts now; a step load waits for the step that
+        # schedules the request.
+        block_ids = list(blocks.get_block_ids()[0]) if self._load_async else []
         self._pending[request.request_id] = DocumentLoad(
             request.request_id,
             document.key,
@@ -253,7 +277,7 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
             document.dtype,
             end - num_external_tokens,
             end,
-            [],
+            block_ids,
         )
 
     def build_connector_meta(
@@ -261,10 +285,12 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
     ) -> KVConnectorMetadata:
         meta = SpeculativeEncodingConnectorMetadata()
         for new_req in scheduler_output.scheduled_new_reqs:
-            load = self._pending.pop(new_req.req_id, None)
-            if load is not None:
+            load = self._pending.get(new_req.req_id)
+            if load is not None and not load.block_ids:
                 load.block_ids = list(new_req.block_ids[0])
-                meta.loads.append(load)
+        for request_id, load in list(self._pending.items()):
+            if load.block_ids:
+                meta.loads.append(self._pending.pop(request_id))
         return meta
 
     def request_finished(
@@ -280,46 +306,112 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self._reader.allocate()
+        if self._load_async:
+            device = next(iter(kv_caches.values())).device
+            if device.type == "cpu":
+                self._loader = ThreadPoolExecutor(1, thread_name_prefix="se-load")
+            else:
+                self._loader = ThreadPoolExecutor(
+                    1,
+                    thread_name_prefix="se-load",
+                    initializer=torch.accelerator.set_device_index,
+                    initargs=(device.index,),
+                )
+                self._stream = torch.Stream(device=device)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, SpeculativeEncodingConnectorMetadata)
         if not metadata.loads:
             return
-        from vllm.model_executor.layers.attention.attention import Attention
-
-        layers = {
-            name: layer
-            for name, layer in forward_context.no_compile_layers.items()
-            if isinstance(layer, Attention)
-            and layer.kv_sharing_target_layer_name is None
-            and layer.kv_cache.numel() > 0
-        }
+        layers = self._attention_layers(forward_context)
         for load in metadata.loads:
-            started = time.perf_counter()
-            try:
+            if self._loader is None:
                 # A deliberate bulk transfer: the step waits for its loads.
                 with gpu_sync_allowed():
-                    self._load(load, layers)
-            except Exception:
-                logger.exception(
-                    "loading document %r for request %s failed",
-                    load.key,
-                    load.request_id,
-                )
-                # Only the blocks this load writes: earlier ones are prefix
-                # cache hits that other requests may share.
-                first = load.start // self._block_size
-                last = -(-load.end // self._block_size)
-                self._failed_block_ids.update(load.block_ids[first:last])
+                    if not self._try_load(load, layers):
+                        self._fail(load)
                 continue
-            logger.debug(
-                "loaded %d tokens of document %r for request %s in %.3f s",
-                load.end - load.start,
-                load.key,
-                load.request_id,
-                time.perf_counter() - started,
+            # The load writes blocks this step may still be zeroing.
+            ready = None
+            if self._stream is not None:
+                ready = torch.Event()
+                ready.record()
+            self._loader.submit(self._load_in_background, load, layers, ready)
+
+    def _attention_layers(self, forward_context: "ForwardContext") -> dict[str, Any]:
+        if self._layers is None:
+            from vllm.model_executor.layers.attention.attention import Attention
+
+            self._layers = {
+                name: layer
+                for name, layer in forward_context.no_compile_layers.items()
+                if isinstance(layer, Attention)
+                and layer.kv_sharing_target_layer_name is None
+                and layer.kv_cache.numel() > 0
+            }
+        return self._layers
+
+    def _load_in_background(
+        self, load: DocumentLoad, layers: dict[str, Any], ready: torch.Event | None
+    ) -> None:
+        ok = False
+        try:
+            stream = self._stream
+            with stream if stream is not None else contextlib.nullcontext():
+                if stream is not None and ready is not None:
+                    stream.wait_event(ready)
+                with gpu_sync_allowed():
+                    ok = self._try_load(load, layers, stream)
+        finally:
+            self._done.put((load, ok))
+
+    def _try_load(
+        self,
+        load: DocumentLoad,
+        layers: dict[str, Any],
+        stream: torch.Stream | None = None,
+    ) -> bool:
+        started = time.perf_counter()
+        try:
+            self._load(load, layers)
+            if stream is not None:
+                stream.synchronize()
+        except Exception:
+            logger.exception(
+                "loading document %r for request %s failed", load.key, load.request_id
             )
+            return False
+        logger.debug(
+            "loaded %d tokens of document %r for request %s in %.3f s",
+            load.end - load.start,
+            load.key,
+            load.request_id,
+            time.perf_counter() - started,
+        )
+        return True
+
+    def _fail(self, load: DocumentLoad) -> None:
+        # Only the blocks this load writes: earlier ones are prefix cache hits
+        # that other requests may share.
+        first = load.start // self._block_size
+        last = -(-load.end // self._block_size)
+        self._failed_block_ids.update(load.block_ids[first:last])
+
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> KVConnectorTransferResults:
+        # A failed background load fails its request alone (the scheduler
+        # recomputes or rejects it per kv_load_failure_policy).
+        results = KVConnectorTransferResults()
+        while True:
+            try:
+                load, ok = self._done.get_nowait()
+            except queue.Empty:
+                return results
+            results.finished_recving.add(load.request_id)
+            if not ok:
+                results.failed_recving.add(load.request_id)
 
     def _load(self, load: DocumentLoad, layers: dict[str, Any]) -> None:
         fd = os.open(self._store / load.key / "kv.safetensors", os.O_RDONLY)
@@ -407,3 +499,7 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
 
     def wait_for_save(self):
         return
+
+    def shutdown(self):
+        if self._loader is not None:
+            self._loader.shutdown(wait=True)

@@ -50,14 +50,15 @@ def _document_kv(ids: list[int]) -> torch.Tensor:
 @pytest.mark.skipif(current_platform.is_rocm(), reason="not validated on ROCm")
 @create_new_process_for_each_test("spawn")
 @pytest.mark.parametrize(
-    "tp, kv_cache_dtype",
+    "tp, kv_cache_dtype, load_async",
     [
-        (1, "auto"),
-        (1, "fp8"),
-        pytest.param(2, "auto", marks=multi_gpu_marks(num_gpus=2)),
+        (1, "auto", True),
+        (1, "auto", False),
+        (1, "fp8", True),
+        pytest.param(2, "auto", True, marks=multi_gpu_marks(num_gpus=2)),
     ],
 )
-def test_requests_read_document_kv_from_store(tmp_path, tp, kv_cache_dtype):
+def test_requests_read_document_kv_from_store(tmp_path, tp, kv_cache_dtype, load_async):
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     document = tokenizer(DOCUMENT)["input_ids"]
     prompts = [document + tokenizer(q)["input_ids"] for q in QUESTIONS]
@@ -75,7 +76,10 @@ def test_requests_read_document_kv_from_store(tmp_path, tp, kv_cache_dtype):
         kv_transfer_config=KVTransferConfig(
             kv_connector="SpeculativeEncodingConnector",
             kv_role="kv_both",
-            kv_connector_extra_config={"store": str(tmp_path)},
+            kv_connector_extra_config={
+                "store": str(tmp_path),
+                "load_async": load_async,
+            },
         ),
     )
 
