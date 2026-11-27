@@ -259,9 +259,12 @@ class DraftModelSpeculator(BaseSpeculator):
         # Pre-temperature logits, cached from the previous decode step.
         # Allocated in load_model. See _init_draft_logits.
         self.draft_logits: DraftLogitsCache | None = None
-        self.use_draft_logits = (
-            self.speculative_config.draft_sample_method == "probabilistic"
-        )
+        probabilistic = self.speculative_config.draft_sample_method == "probabilistic"
+        coupled = self.speculative_config.rejection_sample_method == "coupled"
+        # Coupled verification compares tokens, so it needs no draft logits.
+        # Probabilistic drafts then take the target's noise for each position.
+        self.use_draft_logits = probabilistic and not coupled
+        self.use_coupled_draft_noise = probabilistic and coupled
 
         self.draft_watermarker: DraftWatermarker | None = None
         watermark_config = getattr(vllm_config, "watermark_config", None)
@@ -623,7 +626,20 @@ class DraftModelSpeculator(BaseSpeculator):
             return self.get_draft_top_tokens(hidden_states, spec_step_idx)
 
         logits = self.compute_draft_logits(hidden_states, spec_step_idx)
-        if draft_logits is not None and self.draft_watermarker is not None:
+        if self.use_coupled_draft_noise:
+            # Same (seed, position, token) noise as the target's sample for
+            # this position: the draft wins whenever both argmaxes agree.
+            sampled = gumbel_sample(
+                logits,
+                idx_mapping,
+                temperature,
+                seeds,
+                sample_src_positions,
+                apply_temperature=True,
+                is_drafting=False,
+                use_fp64=self.use_fp64_gumbel,
+            )
+        elif draft_logits is not None and self.draft_watermarker is not None:
             sampled = self.draft_watermarker.sample(
                 logits,
                 idx_mapping,

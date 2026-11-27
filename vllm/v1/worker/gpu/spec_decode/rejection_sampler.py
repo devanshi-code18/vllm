@@ -21,6 +21,7 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+    coupled_verify,
     rejection_sample,
 )
 
@@ -166,6 +167,7 @@ class RejectionSampler:
         self.enable_adaptive_verification = spec_config.enable_adaptive_verification
         rejection_sample_method = spec_config.rejection_sample_method
         self.use_block_verification: bool = False
+        self.use_coupled_verification = rejection_sample_method == "coupled"
         self.fly_window_size = 0
         self.fly_entropy_threshold = spec_config.fly_entropy_threshold
         self.fly_entropy_top_k = spec_config.fly_entropy_top_k
@@ -273,6 +275,28 @@ class RejectionSampler:
         expanded_local_pos: torch.Tensor,
         seq_lens_upper_bound_np: np.ndarray,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.use_coupled_verification:
+            # Draw every row exactly as non-speculative decoding would.
+            target_sampled, processed_logits = self.sampler.sample(
+                logits,
+                expanded_idx_mapping,
+                idx_mapping,
+                idx_mapping_np,
+                pos,
+                draft_sampled,
+                expanded_local_pos,
+                seq_lens_upper_bound_np,
+                return_logprobs=True,
+            )
+            sampled, num_sampled = coupled_verify(
+                target_sampled, draft_sampled, cu_num_logits, self.num_speculative_steps
+            )
+            if self.sampler.trace_replay_state is not None:
+                self.sampler.trace_replay_state.apply_trace_to_verified(
+                    sampled, num_sampled, draft_sampled, cu_num_logits, idx_mapping
+                )
+            return processed_logits, sampled, num_sampled
+
         processed_logits = self.sampler.apply_sampling_params(
             logits,
             expanded_idx_mapping,

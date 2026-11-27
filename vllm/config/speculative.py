@@ -119,7 +119,7 @@ SpeculativeMethod = Literal[
     NgramGPUTypes,
     DSparkModelTypes,
 ]
-RejectionSampleMethod = Literal["standard", "synthetic", "block", "fly"]
+RejectionSampleMethod = Literal["standard", "synthetic", "block", "fly", "coupled"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
 
 _QWEN3_OMNI_DSPARK_ARCHITECTURE = "Qwen3OmniDSparkModel"
@@ -609,7 +609,11 @@ class SpeculativeConfig:
     probability calibrated to synthetic_acceptance_rate. 'block' uses block
     verification (Sun et al.), which jointly verifies the draft tokens as a
     block instead of one at a time. 'fly' applies FLy's lossy, entropy-gated
-    deferred window to the native per-token acceptance decisions."""
+    deferred window to the native per-token acceptance decisions. 'coupled'
+    accepts a draft token iff it equals the target's own seeded Gumbel-max
+    sample at that position, so a seeded request produces the same tokens with
+    speculation on or off and with any drafter; probabilistic drafts are drawn
+    with the target's noise (Daliri et al., arXiv 2408.07978)."""
 
     synthetic_acceptance_rates: list[float] | None = None
     """Per-position *unconditional* acceptance rates for synthetic rejection

@@ -21,6 +21,7 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     unconditional_to_conditional_rates,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+    coupled_verify,
     rejection_sample,
 )
 
@@ -820,6 +821,177 @@ def test_multiround_rejection_sample_is_unbiased(
     for position in range(num_tokens):
         _assert_distribution_match(
             output[:, position], target_probs, device, label=f"position {position}"
+        )
+
+
+def _coupled_decode(
+    target_table: torch.Tensor,
+    draft_table: torch.Tensor | None,
+    drafter: str,
+    first_tokens: torch.Tensor,
+    seeds: torch.Tensor,
+    temperature: float,
+    num_tokens: int,
+    k: int,
+) -> tuple[torch.Tensor, int]:
+    """Decode a bigram target with coupled verification; k == 0 is no drafter.
+
+    Row `t` of a table holds the next-token logits after token `t`; the target's
+    already carry the temperature, as processed logits do. Returns the tokens
+    and the number of accepted drafts.
+    """
+    device = target_table.device
+    num_reqs = first_tokens.shape[0]
+    req_ids = torch.arange(num_reqs, device=device)
+    temp = torch.full((num_reqs,), temperature, device=device)
+    out = torch.empty(num_reqs, num_tokens + k + 1, dtype=torch.int64, device=device)
+    out[:, 0] = first_tokens
+    lengths = torch.ones(num_reqs, dtype=torch.int64, device=device)
+    accepted = 0
+    while (lengths <= num_tokens).any():
+        # Draft j proposes position lengths + j from the token before it, with
+        # the noise the target samples that position with.
+        drafts = torch.empty(num_reqs, k + 1, dtype=torch.int64, device=device)
+        drafts[:, 0] = out[req_ids, lengths - 1]
+        for j in range(k):
+            if drafter == "coupled":
+                assert draft_table is not None
+                drafts[:, j + 1] = gumbel_sample(
+                    draft_table[drafts[:, j]],
+                    req_ids,
+                    temp,
+                    seeds,
+                    lengths - 1 + j,
+                    apply_temperature=True,
+                    is_drafting=False,
+                )
+            elif drafter == "greedy":
+                assert draft_table is not None
+                drafts[:, j + 1] = draft_table[drafts[:, j]].argmax(dim=-1)
+            elif drafter == "random":
+                drafts[:, j + 1] = torch.randint_like(
+                    drafts[:, j], target_table.shape[0]
+                )
+            else:
+                assert drafter == "repeat"
+                drafts[:, j + 1] = drafts[:, j]
+        positions = lengths[:, None] - 1 + torch.arange(k + 1, device=device)
+        target_sampled = gumbel_sample(
+            target_table[drafts.flatten()],
+            req_ids.repeat_interleave(k + 1),
+            temp,
+            seeds,
+            positions.flatten(),
+            apply_temperature=False,
+            is_drafting=False,
+        )
+        cu_num_logits = (k + 1) * torch.arange(
+            num_reqs + 1, dtype=torch.int32, device=device
+        )
+        sampled, num_sampled = coupled_verify(
+            target_sampled, drafts.flatten(), cu_num_logits, k
+        )
+        num_sampled = num_sampled * (lengths <= num_tokens)
+        for column in range(k + 1):
+            valid = num_sampled > column
+            out[req_ids[valid], lengths[valid] + column] = sampled[valid, column]
+        accepted += int((num_sampled - 1).clamp(min=0).sum())
+        lengths += num_sampled
+    return out[:, 1 : num_tokens + 1], accepted
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.7, 1.0])
+def test_coupled_verification_is_speculation_invariant(temperature: float):
+    """A seeded request emits the same tokens with or without speculation,
+    with any drafter and any number of draft tokens.
+
+    Coupled verification emits the target's own seeded sample at every
+    position and uses a draft only to decide how many samples a step emits.
+    """
+    torch.manual_seed(0)
+    device = DEVICE
+    vocab_size, num_reqs, num_tokens = 512, 64, 48
+    target_table = torch.randn(vocab_size, vocab_size, device=device) * 3.0
+    draft_table = target_table + torch.randn_like(target_table)
+    if temperature > 0:
+        target_table = target_table / temperature
+    first_tokens = torch.randint(vocab_size, (num_reqs,), device=device)
+    seeds = torch.randint(2**62, (num_reqs,), device=device)
+
+    reference, _ = _coupled_decode(
+        target_table, None, "none", first_tokens, seeds, temperature, num_tokens, 0
+    )
+    for drafter in ("coupled", "greedy", "random", "repeat"):
+        for k in (1, 3, 7):
+            tokens, accepted = _coupled_decode(
+                target_table,
+                draft_table,
+                drafter,
+                first_tokens,
+                seeds,
+                temperature,
+                num_tokens,
+                k,
+            )
+            assert torch.equal(tokens, reference), f"{drafter=} {k=}"
+            if drafter in ("coupled", "greedy"):
+                assert accepted > num_reqs * num_tokens // 8, f"{drafter=} {k=}"
+
+
+@pytest.mark.parametrize("num_speculative_steps", [1, 3])
+def test_coupled_verification_is_unbiased_with_shared_noise(
+    num_speculative_steps: int,
+):
+    """Coupled verification keeps the target law when drafts share its noise.
+
+    Mirrors test_gumbel_drafted_rejection_sample_is_unbiased, where a shared
+    stream biases the standard residual: here proposals are drawn on the very
+    (seed, pos) noise the target samples with, from a draft that ranks tokens
+    in the opposite order.
+    """
+    torch.manual_seed(42)
+    device = DEVICE
+    k = num_speculative_steps
+    target_logits_1d = torch.randn(
+        NARROW_VOCAB_SIZE, device=device, dtype=torch.float32
+    )
+    inputs = _build_rejection_sample_inputs(
+        target_logits_1d,
+        -target_logits_1d,
+        k,
+        temperature=1.0,
+        num_trials=NARROW_NUM_TRIALS,
+    )
+    draft_rows = inputs["pos"].view(NARROW_NUM_TRIALS, k + 1)[:, :k].reshape(-1)
+    draft_tokens = gumbel_sample(
+        (-target_logits_1d).expand(NARROW_NUM_TRIALS * k, -1),
+        inputs["expanded_idx_mapping"][draft_rows].contiguous(),
+        inputs["temperature"],
+        inputs["seed"],
+        inputs["pos"][draft_rows].contiguous(),
+        apply_temperature=True,
+        is_drafting=False,
+    )
+    draft_sampled = inputs["draft_sampled"].view(NARROW_NUM_TRIALS, k + 1)
+    draft_sampled[:, 1:] = draft_tokens.view(NARROW_NUM_TRIALS, k)
+    target_sampled = gumbel_sample(
+        inputs["target_logits"],
+        inputs["expanded_idx_mapping"],
+        inputs["temperature"],
+        inputs["seed"],
+        inputs["pos"],
+        apply_temperature=False,
+        is_drafting=False,
+    )
+    sampled, num_sampled = coupled_verify(
+        target_sampled, inputs["draft_sampled"], inputs["cu_num_logits"], k
+    )
+
+    target_probs = torch.softmax(target_logits_1d, dim=0)
+    for pos in range(k + 1):
+        accepted_mask = num_sampled >= pos + 1
+        _assert_distribution_match(
+            sampled[accepted_mask, pos], target_probs, device, label=f"position {pos}"
         )
 
 

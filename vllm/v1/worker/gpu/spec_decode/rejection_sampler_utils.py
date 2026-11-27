@@ -1466,3 +1466,72 @@ def rejection_sample(
         num_warps=1,
     )
     return sampled, num_sampled
+
+
+@triton.jit
+def _coupled_verify_kernel(
+    # [num_reqs, num_speculative_steps + 1]
+    sampled_ptr,
+    sampled_stride,
+    # [num_reqs]
+    num_sampled_ptr,
+    # [num_logits]
+    target_sampled_ptr,
+    # [num_logits]
+    draft_sampled_ptr,
+    # [num_reqs + 1]
+    cu_num_logits_ptr,
+):
+    req_idx = tl.program_id(0)
+    start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
+    end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
+    num_draft_tokens = end_idx - start_idx - 1
+
+    num_sampled = tl.zeros((), tl.int32)
+    verifying = True
+    for i in range(num_draft_tokens + 1):
+        if verifying:
+            target_token = tl.load(target_sampled_ptr + start_idx + i)
+            tl.store(sampled_ptr + req_idx * sampled_stride + i, target_token)
+            num_sampled += 1
+            # The draft at local position i + 1 proposes the token sampled
+            # from row i. A -1 placeholder never matches.
+            draft_token = tl.load(
+                draft_sampled_ptr + start_idx + i + 1,
+                mask=i < num_draft_tokens,
+                other=-1,
+            )
+            verifying = draft_token == target_token
+    tl.store(num_sampled_ptr + req_idx, num_sampled)
+
+
+def coupled_verify(
+    # [num_logits]
+    target_sampled: torch.Tensor,
+    # [num_logits]
+    draft_sampled: torch.Tensor,
+    # [num_reqs + 1]
+    cu_num_logits: torch.Tensor,
+    num_speculative_steps: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Verify drafts against the target's own samples.
+
+    `target_sampled[j]` is what non-speculative sampling draws from row `j`.
+    Each request emits those samples up to and including the first one its
+    draft does not match, so the emitted tokens never depend on the drafts:
+    for a seeded request they equal non-speculative decoding, and their law is
+    the target's, since a draft only decides how many samples a step emits.
+    """
+    num_reqs = cu_num_logits.shape[0] - 1
+    sampled = target_sampled.new_empty(num_reqs, num_speculative_steps + 1)
+    num_sampled = target_sampled.new_empty(num_reqs, dtype=torch.int32)
+    _coupled_verify_kernel[(num_reqs,)](
+        sampled,
+        sampled.stride(0),
+        num_sampled,
+        target_sampled,
+        draft_sampled,
+        cu_num_logits,
+        num_warps=1,
+    )
+    return sampled, num_sampled
