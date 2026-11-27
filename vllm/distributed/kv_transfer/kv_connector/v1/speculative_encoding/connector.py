@@ -76,6 +76,7 @@ class DocumentLoad:
     start: int
     end: int
     block_ids: list[int]
+    layer_inputs: bool = False
 
 
 @dataclass
@@ -89,6 +90,12 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
     `kv_connector_extra_config`:
         store: The store directory (required), readable by the scheduler and
             every worker.
+        layer_inputs_chunk_tokens: Tokens per write of a layer-inputs
+            document (default 4096): bounds the GPU memory a load holds.
+
+    A document holds either the served model's K/V or its per-layer inputs;
+    the latter are written by the model itself (its own, possibly quantized,
+    K/V projections) and need `register_kv_from_layer_inputs_writer`.
 
     Translated KV is approximate, so requests that load a document declare its
     provenance: their blocks are cached apart from natively prefilled ones.
@@ -144,6 +151,16 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
             model_config.get_total_num_kv_heads(),
             model_config.get_head_size(),
         )
+        self._input_geometry = (
+            model_config.get_total_num_hidden_layers(),
+            model_config.get_hidden_size(),
+        )
+        self._chunk_tokens = int(
+            self._kv_transfer_config.get_from_extra_config(
+                "layer_inputs_chunk_tokens", 4096
+            )
+        )
+        self._writer: Any = None
         # Scheduler side.
         self._documents: OrderedDict[str, StoredDocument] = OrderedDict()
         self._matches: dict[str, StoredDocument | None] = {}
@@ -166,7 +183,7 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
 
     def _document(self, key: str) -> StoredDocument | None:
         document = self._documents.get(key)
-        if document is not None and (self._store / key / "kv.safetensors").is_file():
+        if document is not None and (self._store / key / document.file).is_file():
             self._documents.move_to_end(key)
             return document
         self._documents.pop(key, None)
@@ -178,7 +195,19 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
         except (OSError, ValueError) as e:
             self._skip("invalid", "document %r is not readable: %s", key, e)
             return None
-        if (document.num_kv_heads, document.head_size) != self._geometry:
+        if document.layer_inputs:
+            if (document.num_layers, document.hidden_size) != self._input_geometry:
+                self._skip(
+                    "geometry",
+                    "document %r has inputs of %d layers of width %d; this model "
+                    "has %d of %d",
+                    key,
+                    document.num_layers,
+                    document.hidden_size,
+                    *self._input_geometry,
+                )
+                return None
+        elif (document.num_kv_heads, document.head_size) != self._geometry:
             self._skip(
                 "geometry",
                 "document %r has %d KV heads of size %d; this model has %d of %d",
@@ -253,6 +282,7 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
             end - num_external_tokens,
             end,
             [],
+            document.layer_inputs,
         )
 
     def build_connector_meta(
@@ -279,6 +309,9 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self._reader.allocate()
+
+    def register_kv_from_layer_inputs_writer(self, writer: Any) -> None:
+        self._writer = writer
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         metadata = self._get_connector_metadata()
@@ -321,13 +354,60 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
             )
 
     def _load(self, load: DocumentLoad, layers: dict[str, Any]) -> None:
-        fd = os.open(self._store / load.key / "kv.safetensors", os.O_RDONLY)
+        file = "layer_inputs.safetensors" if load.layer_inputs else "kv.safetensors"
+        fd = os.open(self._store / load.key / file, os.O_RDONLY)
         try:
             size = int.from_bytes(os.pread(fd, 8, 0), "little")
             header = json.loads(os.pread(fd, size, 8))
-            self._write_layers(fd, 8 + size, header, load, layers)
+            if load.layer_inputs:
+                self._write_from_layer_inputs(fd, 8 + size, header, load)
+            else:
+                self._write_layers(fd, 8 + size, header, load, layers)
         finally:
             os.close(fd)
+
+    def _write_from_layer_inputs(
+        self, fd: int, data_start: int, header: dict[str, Any], load: DocumentLoad
+    ) -> None:
+        if self._writer is None:
+            raise RuntimeError(
+                "document holds per-layer inputs, but the served model cannot "
+                "write its KV cache from them in this configuration"
+            )
+        num_layers, hidden = self._input_geometry
+        shape = [load.num_tokens, hidden]
+        entries = [header[f"layers.{i}"] for i in range(num_layers)]
+        for entry in entries:
+            check_layer(entry, shape, load.dtype)
+        row = hidden * load.dtype.itemsize
+        device = self._writer.device
+        for first in range(load.start, load.end, self._chunk_tokens):
+            last = min(load.end, first + self._chunk_tokens)
+            ranges = [
+                (
+                    data_start + entry["data_offsets"][0] + first * row,
+                    (last - first) * row,
+                )
+                for entry in entries
+            ]
+            pieces = split_ranges(ranges, self._reader.chunk_bytes)
+            flat = torch.empty(
+                num_layers * (last - first) * row, dtype=torch.uint8, device=device
+            )
+            position = 0
+            staged = self._reader.read(fd, pieces)
+            try:
+                for buffer, piece in staged:
+                    flat[position : position + piece.numel()].copy_(
+                        piece, non_blocking=True
+                    )
+                    self._reader.release(buffer)
+                    position += piece.numel()
+            finally:
+                staged.close()
+            inputs = flat.view(load.dtype).view(num_layers, last - first, hidden)
+            inputs = inputs.to(self._writer.input_dtype)
+            self._writer.write(list(inputs.unbind(0)), first, [load.block_ids])
 
     def _write_layers(
         self,

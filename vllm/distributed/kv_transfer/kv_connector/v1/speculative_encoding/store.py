@@ -5,6 +5,11 @@
     <store>/<key>/meta.json        format, prompt_token_ids, KV geometry
     <store>/<key>/kv.safetensors   "layers.<i>": [2, num_kv_heads, N, head_size]
 
+or, with the layer-inputs payload (the served model writes its own K/V):
+
+    <store>/<key>/meta.json                  format, prompt_token_ids, geometry
+    <store>/<key>/layer_inputs.safetensors   "layers.<i>": [N, hidden_size]
+
 `write_document` writes into a temporary directory and renames it into place,
 so readers never see a partial document. Published documents are immutable.
 """
@@ -22,6 +27,11 @@ import torch
 from safetensors.torch import save_file
 
 FORMAT = "speculative-encoding-kv/1"
+LAYER_INPUTS_FORMAT = "speculative-encoding-layer-inputs/1"
+PAYLOAD_FILES = {
+    FORMAT: "kv.safetensors",
+    LAYER_INPUTS_FORMAT: "layer_inputs.safetensors",
+}
 DTYPES = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
@@ -40,10 +50,20 @@ class StoredDocument:
     head_size: int
     dtype: torch.dtype
     provenance: str
+    format: str = FORMAT
+    hidden_size: int = 0
 
     @property
     def num_tokens(self) -> int:
         return len(self.prompt_token_ids)
+
+    @property
+    def layer_inputs(self) -> bool:
+        return self.format == LAYER_INPUTS_FORMAT
+
+    @property
+    def file(self) -> str:
+        return PAYLOAD_FILES[self.format]
 
 
 def write_document(
@@ -82,7 +102,75 @@ def write_document(
     dtype = str(layers[0].dtype).removeprefix("torch.")
     if dtype not in DTYPES:
         raise ValueError(f"KV dtype {dtype} is not one of {list(DTYPES)}")
-    store = Path(store)
+    tensors = {
+        f"layers.{i}": layer.permute(0, 2, 1, 3).contiguous().cpu()
+        for i, layer in enumerate(layers)
+    }
+    meta = {
+        "format": FORMAT,
+        "prompt_token_ids": [int(t) for t in prompt_token_ids],
+        "num_layers": len(layers),
+        "num_kv_heads": heads,
+        "head_size": head_size,
+        "dtype": dtype,
+        "provenance": provenance,
+    }
+    return _publish(Path(store), key, tensors, meta)
+
+
+def write_document_layer_inputs(
+    store: str | os.PathLike,
+    key: str,
+    prompt_token_ids: Sequence[int],
+    layer_inputs: torch.Tensor | Sequence[torch.Tensor],
+    provenance: str = "",
+) -> Path:
+    """Publish a translated document as per-layer inputs: the served model
+    computes K/V from them with its own weights (quantized ones included),
+    through `KVConnectorBase_V1.register_kv_from_layer_inputs_writer`.
+
+    Args:
+        store: The store directory.
+        key: The document key requests name.
+        prompt_token_ids: The `N` prompt tokens the inputs cover.
+        layer_inputs: Per decoder layer, its `[N, hidden_size]` input (layer
+            0: the input embeddings), or one `[num_layers, N, hidden_size]`
+            tensor.
+        provenance: Where the inputs came from.
+
+    Returns:
+        The document's directory.
+
+    """
+    if not _KEY.fullmatch(key):
+        raise ValueError(f"invalid document key {key!r}")
+    if isinstance(layer_inputs, torch.Tensor):
+        layers = list(layer_inputs.unbind(0))
+    else:
+        layers = list(layer_inputs)
+    tokens, hidden = layers[0].shape
+    if tokens != len(prompt_token_ids):
+        raise ValueError(
+            f"inputs hold {tokens} tokens, prompt_token_ids {len(prompt_token_ids)}"
+        )
+    dtype = str(layers[0].dtype).removeprefix("torch.")
+    if dtype not in DTYPES:
+        raise ValueError(f"dtype {dtype} is not one of {list(DTYPES)}")
+    tensors = {f"layers.{i}": x.contiguous().cpu() for i, x in enumerate(layers)}
+    meta = {
+        "format": LAYER_INPUTS_FORMAT,
+        "prompt_token_ids": [int(t) for t in prompt_token_ids],
+        "num_layers": len(layers),
+        "hidden_size": hidden,
+        "dtype": dtype,
+        "provenance": provenance,
+    }
+    return _publish(Path(store), key, tensors, meta)
+
+
+def _publish(
+    store: Path, key: str, tensors: dict[str, torch.Tensor], meta: dict
+) -> Path:
     store.mkdir(parents=True, exist_ok=True)
     final = store / key
     if final.exists():
@@ -91,20 +179,7 @@ def write_document(
         )
     tmp = Path(tempfile.mkdtemp(dir=store, prefix=f".{key}."))
     try:
-        tensors = {
-            f"layers.{i}": layer.permute(0, 2, 1, 3).contiguous().cpu()
-            for i, layer in enumerate(layers)
-        }
-        save_file(tensors, tmp / "kv.safetensors")
-        meta = {
-            "format": FORMAT,
-            "prompt_token_ids": [int(t) for t in prompt_token_ids],
-            "num_layers": len(layers),
-            "num_kv_heads": heads,
-            "head_size": head_size,
-            "dtype": dtype,
-            "provenance": provenance,
-        }
+        save_file(tensors, tmp / PAYLOAD_FILES[meta["format"]])
         (tmp / "meta.json").write_text(json.dumps(meta))
         # Fails, rather than replaces, if another writer published `key` first.
         os.rename(tmp, final)
@@ -128,19 +203,23 @@ def read_document(store: Path, key: str) -> StoredDocument:
     folder = store / key
     with open(folder / "meta.json", encoding="utf-8") as f:
         meta = json.load(f)
-    if not (folder / "kv.safetensors").is_file():
-        raise FileNotFoundError(folder / "kv.safetensors")
+    file = PAYLOAD_FILES.get(meta.get("format"))
+    if file is None:
+        raise ValueError(f"unknown format {meta.get('format')!r}")
+    if not (folder / file).is_file():
+        raise FileNotFoundError(folder / file)
     try:
-        if meta["format"] != FORMAT:
-            raise ValueError(f"unknown format {meta['format']!r}")
+        layer_inputs = meta["format"] == LAYER_INPUTS_FORMAT
         return StoredDocument(
             key=key,
             prompt_token_ids=tuple(int(t) for t in meta["prompt_token_ids"]),
             num_layers=int(meta["num_layers"]),
-            num_kv_heads=int(meta["num_kv_heads"]),
-            head_size=int(meta["head_size"]),
+            num_kv_heads=0 if layer_inputs else int(meta["num_kv_heads"]),
+            head_size=0 if layer_inputs else int(meta["head_size"]),
             dtype=DTYPES[meta["dtype"]],
             provenance=str(meta.get("provenance", "")),
+            format=meta["format"],
+            hidden_size=int(meta["hidden_size"]) if layer_inputs else 0,
         )
     except (KeyError, TypeError) as e:
         raise ValueError(f"{folder / 'meta.json'}: missing or invalid {e}") from e

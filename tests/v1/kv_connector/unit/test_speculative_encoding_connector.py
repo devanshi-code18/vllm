@@ -14,6 +14,7 @@ from vllm.config import SpeculativeConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding import (
     write_document,
+    write_document_layer_inputs,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding.connector import (  # noqa: E501
     SpeculativeEncodingConnector,
@@ -245,6 +246,53 @@ def test_failed_load_spares_shared_prefix_blocks(tmp_path, case):
     )
     assert shared.status == RequestStatus.RUNNING
     assert loading.status == RequestStatus.FINISHED_ERROR
+
+
+HIDDEN = 768  # facebook/opt-125m
+
+
+class _RecordingWriter:
+    """Stands in for the worker's KV-from-layer-inputs writer (GPU only)."""
+
+    device = torch.device("cpu")
+    input_dtype = torch.bfloat16
+
+    def __init__(self):
+        self.writes = []
+
+    def write(self, layer_inputs, start, block_ids):
+        self.writes.append((torch.stack(layer_inputs), start, block_ids))
+
+
+@pytest.mark.parametrize("with_writer", [True, False])
+def test_layer_inputs_document_loads_through_writer(tmp_path, with_writer):
+    """[full-stack integration] A layer-inputs document is handed to the
+    served model's writer in chunks; without a writer the load fails."""
+    inputs = torch.randn(LAYERS, len(DOCUMENT), HIDDEN).to(torch.bfloat16)
+    write_document_layer_inputs(tmp_path, "doc0", DOCUMENT, inputs)
+    config = _config(tmp_path, layer_inputs_chunk_tokens=16)
+    scheduler = create_scheduler(config)
+    output, _, (load,) = _schedule_one(scheduler, _request(DOCUMENT + [7, 8]))
+    assert load.layer_inputs and (load.start, load.end) == (0, len(DOCUMENT))
+    worker = SpeculativeEncodingConnector(
+        config, KVConnectorRole.WORKER, scheduler.kv_cache_config
+    )
+    writer = _RecordingWriter()
+    if with_writer:
+        worker.register_kv_from_layer_inputs_writer(writer)
+    worker.bind_connector_metadata(output.kv_connector_metadata)
+    worker.start_load_kv(
+        ForwardContext(no_compile_layers={}, attn_metadata={}, slot_mapping={})
+    )
+    failed = worker.get_block_ids_with_load_errors()
+    if not with_writer:
+        assert failed == set(load.block_ids[:4])
+        return
+    assert not failed
+    assert [start for _, start, _ in writer.writes] == [0, 16, 32, 48]
+    assert all(ids == [load.block_ids] for _, _, ids in writer.writes)
+    written = torch.cat([chunk for chunk, _, _ in writer.writes], dim=1)
+    assert torch.equal(written, inputs)
 
 
 def _kv_cache_config(num_groups=1):
