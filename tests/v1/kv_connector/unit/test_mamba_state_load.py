@@ -23,10 +23,11 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 MODEL = "Qwen/Qwen3.5-0.8B"
 # (prefix_match_unit, prefix length): the load ends on a 576-token Mamba block
-# boundary.
-CASES = {"block_end": (None, 1152)}
-# Captured prompt caches by name.
+# boundary, or inside a block with 64-token prefix matching.
+CASES = {"block_end": (None, 1152), "inside_block": (64, 1216)}
+# Captured prompt caches by name, and the requests that loaded one.
 STORE: dict[int, dict] = {}
+LOADS: list[str] = []
 
 
 @dataclass
@@ -66,6 +67,7 @@ class StateLoadConnector(KVConnectorBase_V1, SupportsHMA):
     def update_state_after_alloc(self, request, blocks, num_external_tokens):
         params = request.kv_transfer_params or {}
         if num_external_tokens > 0:
+            LOADS.append(request.request_id)
             self.pending[request.request_id] = ("load", params["load"])
         elif "capture" in params:
             self.pending[request.request_id] = ("capture", params["capture"])
@@ -211,9 +213,11 @@ def test_loaded_mamba_state_with_prefix_caching(
     prefix_len: int,
 ):
     """With prefix caching, a request computes its prompt from the state the
-    connector loaded."""
+    connector loaded, and a request sharing the loaded prefix hits it locally
+    instead of loading it again."""
     token_ids, expected = reference
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    LOADS.clear()
     llm = _llm(
         enable_prefix_caching=True,
         prefix_match_unit=prefix_match_unit,
@@ -238,3 +242,5 @@ def test_loaded_mamba_state_with_prefix_caching(
         name_1="prefix_caching",
         always_check_logprobs=True,
     )
+    # Only the first request loads; the second resumes from the cached state.
+    assert len(LOADS) == 1

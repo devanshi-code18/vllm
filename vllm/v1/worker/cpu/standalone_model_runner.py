@@ -1150,6 +1150,13 @@ class StandaloneCPUModelRunner(LoRAModelRunnerMixin):
             is_padding=input_batch.is_padding,
         ):
             self.kv_connector.pre_forward(scheduler_output, input_batch)
+            # Copies that read blocks this step's KV-connector loads write.
+            if scheduler_output.kv_cache_block_copies_after_kv_load:
+                copy_kv_cache_blocks_inplace(
+                    self.kv_caches,
+                    self.kv_cache_config.num_blocks,
+                    scheduler_output.kv_cache_block_copies_after_kv_load,
+                )
             self.model_state.copy_deferred_state()
             model_output = self.model(**model_inputs)
         self.kv_connector.finish_forward()

@@ -253,6 +253,14 @@ class SingleTypeKVCacheManager(ABC):
         # managers (full attention, mamba); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
         self._pending_cow_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+        # Copies whose sources KV-connector loads write; they run after the
+        # step's loads.
+        self._pending_post_load_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+        # Whether to cache the Mamba state KV-connector loads leave at their
+        # end (`KVCacheManager.enable_loaded_state_caching`), and per request
+        # the token count a load ends at, until that state is cached.
+        self.cache_loaded_states = False
+        self._loaded_boundaries: dict[str, int] = {}
         # Boundary-state offload hand-off for external KV connectors. A mamba
         # block table is not append-only (interior states are
         # nulled/freed and speculative blocks relocate in place), so a
@@ -465,6 +473,12 @@ class SingleTypeKVCacheManager(ABC):
         num_total_computed_tokens = (
             num_local_computed_tokens + num_external_computed_tokens
         )
+        if (
+            self.enable_caching
+            and self.cache_loaded_states
+            and num_external_computed_tokens > 0
+        ):
+            self._loaded_boundaries[request_id] = num_total_computed_tokens
         num_skipped_tokens = self.get_num_skipped_tokens(num_total_computed_tokens)
         if num_skipped_tokens > 0:
             # Some external computed tokens may be skipped too.
@@ -559,6 +573,14 @@ class SingleTypeKVCacheManager(ABC):
         """Drain pending CoW source and destination block pairs."""
         pending_copies = self._pending_cow_copies
         self._pending_cow_copies = []
+        return pending_copies
+
+    def take_pending_post_load_copies(
+        self,
+    ) -> list[tuple[KVCacheBlock, KVCacheBlock]]:
+        """Drain pending copies whose sources KV-connector loads write."""
+        pending_copies = self._pending_post_load_copies
+        self._pending_post_load_copies = []
         return pending_copies
 
     def take_pending_boundary_state_offloads(
@@ -727,6 +749,7 @@ class SingleTypeKVCacheManager(ABC):
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
+        self._loaded_boundaries.pop(request_id, None)
         return trim_null_head(req_blocks)
 
     def free(self, request_id: str) -> None:
@@ -979,6 +1002,39 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         if self.block_size == hash_block_size:
             return
         self._cache_partial_tail_block(request, num_tokens)
+        self._cache_loaded_boundary(request, num_tokens)
+
+    def _cache_loaded_boundary(self, request: Request, num_tokens: int) -> None:
+        """Keep a KV-connector load's end reachable when it lands inside a
+        block; the Mamba state loaded with it is cached at the same boundary.
+
+        The entry is registered on every call until the block fills: a longer
+        prompt-tail entry, or the block's full hash, replaces shorter entries,
+        after which this one goes back in as a secondary key.
+        """
+        boundary = self._loaded_boundaries.get(request.request_id)
+        if boundary is None or boundary > num_tokens:
+            return
+        block_idx = boundary // self.block_size
+        blocks = self.req_to_blocks[request.request_id]
+        cacheable = (
+            boundary % self.block_size != 0
+            and boundary % self.cache_hit_alignment_tokens == 0
+            and block_idx < len(blocks)
+        )
+        if cacheable:
+            self.block_pool.cache_partial_block(
+                request=request,
+                block=blocks[block_idx],
+                num_tokens=boundary,
+                kv_cache_group_id=self.kv_cache_group_id,
+                block_size=self.block_size,
+            )
+        if (
+            not cacheable
+            or self.num_cached_block.get(request.request_id, 0) > block_idx
+        ):
+            del self._loaded_boundaries[request.request_id]
 
     def _cache_partial_tail_block(
         self,
@@ -1967,6 +2023,10 @@ class MambaManager(SingleTypeKVCacheManager):
             self._tips: dict[BlockHash, BlockHash | None] = {}
             self._req_hit: dict[str, BlockHash] = {}
             self._req_tip: dict[str, tuple[int, BlockHash]] = {}
+            # Per request, the copy of the state a KV-connector load left at a
+            # cacheable boundary: cached there and held until the request is
+            # freed, so a preempted request resumes from it.
+            self._loaded_state_blocks: dict[str, KVCacheBlock] = {}
 
     def add_local_computed_blocks(
         self,
@@ -2329,7 +2389,19 @@ class MambaManager(SingleTypeKVCacheManager):
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
             )
-            return num_new_blocks + num_external_blocks + num_evictable_computed_blocks
+            # Plus the copy that keeps a state loaded at a cacheable boundary
+            # cached (`_checkpoint_loaded_state`).
+            num_loaded_state_copies = int(
+                self.cache_loaded_states
+                and num_external_blocks > 0
+                and total_computed_tokens % self.cache_hit_alignment_tokens == 0
+            )
+            return (
+                num_new_blocks
+                + num_external_blocks
+                + num_evictable_computed_blocks
+                + num_loaded_state_copies
+            )
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
@@ -2486,7 +2558,9 @@ class MambaManager(SingleTypeKVCacheManager):
         return self.kv_cache_group_id, source_block, boundary_tokens
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+        loaded_state_block = None
         if self.prefix_caching:
+            loaded_state_block = self._loaded_state_blocks.pop(request_id, None)
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
             self._num_retired_blocks.pop(request_id, None)
@@ -2506,7 +2580,11 @@ class MambaManager(SingleTypeKVCacheManager):
                 for entry in self._pending_boundary_state_offloads
                 if entry[0] != request_id
             ]
-        return super().pop_blocks_for_free(request_id)
+        blocks = super().pop_blocks_for_free(request_id)
+        if loaded_state_block is not None:
+            # Freed last, so it is evicted after the request's other blocks.
+            blocks.insert(0, loaded_state_block)
+        return blocks
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """Get the number of tokens whose mamba state are not needed anymore. Mamba only
@@ -2524,6 +2602,10 @@ class MambaManager(SingleTypeKVCacheManager):
         replay_boundaries: Sequence[int],
     ) -> None:
         if self.prefix_caching:
+            # The first call after a KV-connector load: the load has landed.
+            boundary = self._loaded_boundaries.pop(request.request_id, None)
+            if boundary is not None and boundary <= num_tokens:
+                self._checkpoint_loaded_state(request, boundary)
             chunk_range = self._req_chunk_ranges.pop(request.request_id, None)
             if chunk_range is not None:
                 query_start, query_end = chunk_range
@@ -2567,6 +2649,51 @@ class MambaManager(SingleTypeKVCacheManager):
                             block.block_hash_num_tokens,
                         )
                     )
+
+    def _checkpoint_loaded_state(self, request: Request, boundary: int) -> None:
+        """Cache the state a KV-connector load left at `boundary`.
+
+        The load writes it into the running state block, which the next
+        forward overwrites, so a spare block takes a copy, run after the load,
+        and is cached at `boundary`.
+        """
+        request_id = request.request_id
+        blocks = self.req_to_blocks[request_id]
+        block_idx = (boundary - 1) // self.block_size
+        hash_block_size = self.block_pool.hash_block_size
+        if (
+            boundary % self.cache_hit_alignment_tokens != 0
+            or boundary > len(request.block_hashes) * hash_block_size
+            or block_idx >= len(blocks)
+            or blocks[block_idx].is_null
+            or request_id in self._loaded_state_blocks
+            or self.block_pool.get_num_free_blocks() == 0
+            # Already cached, e.g. by a request loading it in the same step.
+            or self.block_pool.get_cached_block(
+                request.block_hashes[boundary // hash_block_size - 1],
+                [self.kv_cache_group_id],
+            )
+            is not None
+        ):
+            return
+        source_block = blocks[block_idx]
+        [spare_block] = self.block_pool.get_new_blocks(1)
+        # Both endpoints stay retained until the copy has run on the worker.
+        source_block.ref_cnt += 1
+        spare_block.ref_cnt += 1
+        self._pending_post_load_copies.append((source_block, spare_block))
+        self._loaded_state_blocks[request_id] = spare_block
+        block_hash = self.block_pool.cache_partial_block(
+            request=request,
+            block=spare_block,
+            num_tokens=boundary,
+            kv_cache_group_id=self.kv_cache_group_id,
+            block_size=self.block_size,
+        )
+        if block_hash is not None:
+            # The copy runs with this step; defer same-step hits on it.
+            self.cached_blocks_this_step.add(block_hash)
+            self._record_tip(request_id, spare_block)
 
     def _decode_resume_block_idx(
         self, request_id: str, processed_tokens: int, num_prompt_tokens: int
