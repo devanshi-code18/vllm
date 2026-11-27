@@ -15,7 +15,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
 
 import torch
@@ -30,6 +30,10 @@ from vllm.model_executor.layers.activation import get_act_and_mul_fn
 from vllm.model_executor.layers.attention import (
     Attention,
     EncoderOnlyAttention,
+)
+from vllm.model_executor.layers.kv_from_layer_inputs import (
+    KVWriteTarget,
+    write_decoder_kv,
 )
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
@@ -47,7 +51,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
-from .interfaces import SupportsLoRA, SupportsPP
+from .interfaces import SupportsKVFromLayerInputs, SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -200,14 +204,26 @@ class Gemma3Attention(nn.Module):
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
         q = self.q_norm(q)
         q = q.flatten(-2, -1)
-        k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-        k = self.k_norm(k)
-        k = k.flatten(-2, -1)
+        k = self._norm_k(k)
 
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _norm_k(self, k: torch.Tensor) -> torch.Tensor:
+        k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+        return self.k_norm(k).flatten(-2, -1)
+
+    def kv_from_normed_input(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`forward`'s K (normed, rotated) and V for normed layer inputs, from
+        the same full QKV GEMM (Q is dropped)."""
+        qkv, _ = self.qkv_proj(hidden_states)
+        _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        k, _ = self.rotary_emb(positions, self._norm_k(k))
+        return k, v
 
 
 class Gemma3DecoderLayer(nn.Module):
@@ -371,13 +387,25 @@ class Gemma3Model(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
+    def write_kv_from_layer_inputs(
+        self,
+        layer_inputs: Sequence[torch.Tensor],
+        targets: Mapping[str, KVWriteTarget],
+    ) -> None:
+        write_decoder_kv(
+            self.layers, self.start_layer, self.end_layer, layer_inputs, targets
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
-class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsKVFromLayerInputs):
     hf_to_vllm_mapper = Gemma3Model.hf_to_vllm_mapper
+    # The input norm adds the residual in float32: only the unrounded sum
+    # reproduces the forward.
+    kv_from_layer_inputs_dtype = torch.float32
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -442,6 +470,13 @@ class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    def write_kv_from_layer_inputs(
+        self,
+        layer_inputs: Sequence[torch.Tensor],
+        targets: Mapping[str, KVWriteTarget],
+    ) -> None:
+        self.model.write_kv_from_layer_inputs(layer_inputs, targets)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
