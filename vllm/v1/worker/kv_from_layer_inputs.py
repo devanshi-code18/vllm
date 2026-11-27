@@ -10,11 +10,13 @@ weights (its tensor-parallel shard) and writes them with its own KV-cache
 dtype and scales.
 """
 
-from collections.abc import Sequence
+import contextlib
+from collections.abc import Iterator, Sequence
 
 import numpy as np
 import torch
 
+from vllm import ir
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -133,7 +135,8 @@ class KVFromLayerInputsWriter:
             name: group_targets[group_id]
             for name, group_id in self.layer_groups.items()
         }
-        self.model.write_kv_from_layer_inputs(layer_inputs, targets)
+        with _prefer_kernels():
+            self.model.write_kv_from_layer_inputs(layer_inputs, targets)
 
 
 def _unsupported_reason(
@@ -168,3 +171,22 @@ def _unsupported_reason(
     if foreign:
         return f"KV cache layers the model does not own ({foreign[0]}, ...)"
     return model.kv_from_layer_inputs_unsupported_reason()
+
+
+@contextlib.contextmanager
+def _prefer_kernels() -> Iterator[None]:
+    """The writer runs eagerly: where a compiled model leaves norms and RoPE to
+    Inductor ("native" first), use vLLM's fused kernels instead of a chain of
+    eager PyTorch ops."""
+    ops = (
+        ir.ops.rms_norm,
+        ir.ops.fused_add_rms_norm,
+        ir.ops.rotary_embedding,
+        ir.ops.rotary_embedding_query_only,
+    )
+    with contextlib.ExitStack() as stack:
+        for op in ops:
+            priority = op.get_priority()
+            if priority[:1] == ["native"]:
+                stack.enter_context(op.set_priority(["vllm_c", *priority]))
+        yield
