@@ -1619,6 +1619,31 @@ def test_token_logprobs_large_batch_int64_row_offset():
     )
 
 
+@pytest.mark.parametrize("vocab_size", [151936, 128256])
+def test_token_logprobs_match_fp32_log_softmax_under_batch_invariance(
+    vocab_size: int, monkeypatch: pytest.MonkeyPatch
+):
+    """Under batch invariance, BF16 logits and their FP32 copy must both give
+    log_softmax(logits.float()) bit for bit, the logprobs a trainer computes."""
+    if not current_platform.is_cuda_alike():
+        pytest.skip("the logprob kernel is Triton")
+    import vllm.envs as envs
+    from vllm.model_executor.determinism.batch_invariant import log_softmax
+    from vllm.v1.worker.gpu.sample.logprob import compute_token_logprobs
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    logits = 4 * torch.randn(256, vocab_size, device="cuda", generator=gen)
+    logits = logits.to(torch.bfloat16)
+    token_ids = torch.randint(vocab_size, (256, 4), device="cuda", generator=gen)
+    expected = log_softmax(logits.float()).gather(1, token_ids).view(torch.int32)
+    for x in (logits, logits.float()):
+        actual = compute_token_logprobs(x, token_ids).view(torch.int32)
+        rows = int((actual != expected).any(dim=1).sum())
+        assert rows == 0, f"{x.dtype} logits: {rows}/256 rows differ"
+
+
 @pytest.mark.parametrize("split_topk", [False, True])
 @pytest.mark.parametrize("num_prompt_logprobs", [-1, 3])
 def test_chunked_prompt_logprobs_match_unchunked(

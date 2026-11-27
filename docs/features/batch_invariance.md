@@ -158,6 +158,7 @@ When batch invariance is enabled, vLLM:
 5. On CUDA devices with tuned matmul table entries for the model's bf16 unquantized forward linear layers (Ada, Hopper, Blackwell),
    runs without `torch.compile` using breakable CUDA graphs so tile configs follow the runtime batch size; set `VLLM_USE_BREAKABLE_CUDAGRAPH=0` to opt out.
 6. Splits the LoRA shrink reduction into 8 fixed K chunks that are summed in a fixed order instead of with atomics
+7. Computes every returned logprob (sampled, top-k and prompt) from FP32 logits, so it equals `log_softmax(logits.float())` under the batch-invariant ops bit for bit. An RL trainer that recomputes logprobs this way, with the same forward kernels, gets zero sampler/trainer mismatch
 
 For multimodal vision attention, `VLLM_BATCH_INVARIANT=1` disables Split-KV when
 the `FLASH_ATTN` encoder backend uses FlashAttention 3 on Hopper. On B200,

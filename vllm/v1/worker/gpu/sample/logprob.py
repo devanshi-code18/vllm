@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm.sampling_params import MAX_LOGPROB_TOKEN_IDS, SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
@@ -88,6 +89,11 @@ def compute_token_logprobs(
     # NOTE(woosuk): To save GPU memory, we do not materialize the full
     # [batch_size, vocab_size] logprobs tensor. The kernel computes
     # max + logsumexp per row and only emits logprobs at `token_ids`.
+    if envs.VLLM_BATCH_INVARIANT:
+        # The kernel's summation order follows the input dtype, so BF16 logits
+        # and their FP32 copy give different last bits. Always sum FP32: then
+        # every logprob path agrees with log_softmax(logits.float()).
+        logits = logits.float()
     batch_size, vocab_size = logits.shape
     token_ids = token_ids.to(torch.int64)
     num_logprobs = token_ids.shape[1]

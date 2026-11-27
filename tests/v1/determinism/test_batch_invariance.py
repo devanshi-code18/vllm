@@ -4,6 +4,7 @@ import contextlib
 import os
 import random
 
+import numpy as np
 import pytest
 import torch
 from transformers import AutoTokenizer
@@ -1067,6 +1068,49 @@ def test_sliding_window_logprobs_bitwise_alone_vs_mixed_batch():
             f"Prompt {i}: logprobs differ alone vs batched; "
             f"max abs diff {(lp1 - lpN).abs().max():.3e}"
         )
+
+
+@skip_unsupported
+@pytest.mark.timeout(600)
+def test_logprobs_equal_fp32_log_softmax_of_logits():
+    """A trainer recomputes logprobs as log_softmax(logits.float()). Every
+    logprob vLLM returns must be exactly that, or the sampler/trainer gap of
+    on-policy RL can never be checked for zero."""
+    from vllm.model_executor.determinism.batch_invariant import log_softmax
+
+    rng = random.Random(int(os.getenv("VLLM_TEST_SEED", "12345")))
+    token_ids = [rng.randint(1000, 30000) for _ in range(257)]
+    prompt = TokensPrompt(prompt_token_ids=token_ids)
+
+    def score_every_token(logprobs_mode: str) -> np.ndarray:
+        llm = LLM(
+            model=TEST_MODEL,
+            logprobs_mode=logprobs_mode,
+            max_logprobs=-1,
+            max_model_len=1024,
+            gpu_memory_utilization=0.4,
+            enable_prefix_caching=False,
+            enforce_eager=True,
+        )
+        try:
+            vocab = llm.llm_engine.model_config.get_vocab_size()
+            rows = len(token_ids) - 1
+            ids = np.tile(np.arange(vocab, dtype=np.int32), (rows, 1))
+            sp = SamplingParams(max_tokens=1, prompt_logprob_token_ids=ids)
+            out = llm.generate([prompt], sp, use_tqdm=False)[0]
+            return out.prompt_token_id_logprobs
+        finally:
+            with contextlib.suppress(Exception):
+                llm.llm_engine.engine_core.shutdown()
+
+    logits = score_every_token("raw_logits")
+    logprobs = score_every_token("raw_logprobs")
+    expected = log_softmax(torch.from_numpy(logits).cuda()).cpu().numpy()
+    rows = int((logprobs.view(np.int32) != expected.view(np.int32)).any(axis=1).sum())
+    assert rows == 0, (
+        f"{rows}/{len(logprobs)} rows differ from log_softmax(logits.float()); "
+        f"max abs diff {np.abs(logprobs - expected).max():.3e}"
+    )
 
 
 def LLM_with_max_seqs(
