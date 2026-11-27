@@ -24,6 +24,28 @@ steps:
       depends_on:
       - image-build-amd
 
+- label: ":nvidia: (H100) Cross-Config Parity"
+  key: cross-config-parity
+  timeout_in_minutes: 60
+  working_dir: "/vllm-workspace/tests"
+  device: h100
+  num_devices: 2
+  source_file_dependencies:
+  - vllm/v1/attention
+  - vllm/v1/core
+  - vllm/v1/spec_decode
+  - vllm/v1/worker
+  - vllm/model_executor/layers
+  - vllm/model_executor/determinism
+  - vllm/distributed
+  - tests/correctness/
+  commands:
+  - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  - >-
+    pytest -v -s
+    correctness/test_parity_harness.py
+    correctness/test_cross_config_parity.py
+
 - label: ":nvidia: (H200 MIG 18GB) Basic Correctness CuMem"
   key: basic-correctness-cumem
   automatic_shard: true
