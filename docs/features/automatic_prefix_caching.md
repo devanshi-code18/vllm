@@ -31,6 +31,8 @@ vllm serve <hybrid-model> \
 
 Choose a value that divides the block size of every prefix-cacheable KV cache group, matches the block size of any group that requires block-aligned lookups (such as sliding-window attention), and is a multiple of the per-state compression ratio for models that use one, such as sparse MLA. vLLM validates these at startup and fails if an explicit value would disable partial cache hits. Read the served block size from the startup log. 64 is a reasonable starting point.
 
+State a KV connector loads is cached the same way when the connector writes it where the model computes from it, the request's Mamba block at column `(n - 1) // mamba_block_size` for a load ending at token `n`, and reports that with `loads_mamba_state_at_load_end`. When such a load ends on a boundary a hit can land on (a Mamba block boundary, or a `--prefix-match-unit` multiple), vLLM keeps a copy of the loaded state there, so later requests sharing the loaded prefix, and a preempted request, resume from it instead of loading again.
+
 ### Superseded Mamba state eviction
 
 With prefix caching enabled, vLLM automatically deprioritizes superseded Mamba checkpoints in multi-turn workloads with no extra configuration:

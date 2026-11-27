@@ -6712,6 +6712,67 @@ def test_mamba_shared_prefix_reuse_under_zero_retention():
     assert last_req_hit(retention=0, pin=True) == 2 * block_size
 
 
+def _make_loaded_state_manager(
+    block_size: int, hash_block_size: int, num_blocks: int = 100
+) -> KVCacheManager:
+    config = _make_hybrid_kv_cache_config(
+        hash_block_size, num_blocks, ["full", "mamba"]
+    )
+    for group_id in (0, 1):
+        _replace_group(config, group_id, block_size=block_size)
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        retention_interval=0,
+    )
+    manager.enable_loaded_state_caching()
+    return manager
+
+
+@pytest.mark.parametrize(
+    "block_size,hash_block_size,boundary",
+    [(16, 16, 64), (64, 16, 80)],
+    ids=["block_end", "inside_block"],
+)
+def test_mamba_connector_loaded_state_is_cached_at_its_boundary(
+    block_size: int, hash_block_size: int, boundary: int
+):
+    """A KV-connector load writes the Mamba state at its end into the running
+    state block, which the next forward overwrites. The state is copied into a
+    block the request holds and cached at the load boundary, so a request
+    sharing only the loaded prefix, and the loading request itself once
+    preempted, resume there instead of loading again."""
+    manager = _make_loaded_state_manager(block_size, hash_block_size)
+    prompt = list(range(boundary + 40))
+    loader = make_request("loader", prompt, hash_block_size, sha256)
+    assert (
+        manager.allocate_slots(
+            loader,
+            len(prompt) - boundary,
+            num_external_computed_tokens=boundary,
+        )
+        is not None
+    )
+    mamba_blocks = manager.coordinator.single_type_managers[1].req_to_blocks["loader"]
+    loaded_block = mamba_blocks[(boundary - 1) // block_size]
+    loader.num_computed_tokens = len(prompt)
+    manager.new_step_starts()
+
+    sibling = make_request(
+        "sibling", prompt[:boundary] + [10_000] * 40, hash_block_size, sha256
+    )
+    assert manager.get_computed_blocks(sibling)[1] == boundary
+    # The cached block is a copy, made after the load, of the block it wrote.
+    copies, _ = manager.take_kv_cache_block_copies(after_kv_load=True)
+    assert [c.src_block_id for c in copies] == [loaded_block.block_id]
+
+    manager.free(loader)
+    resumed = make_request("resumed", prompt, hash_block_size, sha256)
+    assert manager.get_computed_blocks(resumed)[1] == boundary
+
+
 @pytest.mark.parametrize("lookahead", [0, 1])
 def test_mamba_sparse_retention_caches_decode_resume_state_on_free(lookahead):
     """Sparse retention caches only the latest decode-crossed Mamba state, once

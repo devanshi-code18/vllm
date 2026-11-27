@@ -916,13 +916,24 @@ class KVCacheManager:
                 blocks = mgr.req_to_blocks[request_id]
                 mgr.new_block_ids.extend(blk.block_id for blk in blocks[start_idx:])
 
+    def enable_loaded_state_caching(self) -> None:
+        """Cache the Mamba state a KV-connector load leaves at its end; the
+        connector writes it into column `(n - 1) // block_size`."""
+        for mgr in self.coordinator.single_type_managers:
+            mgr.cache_loaded_states = True
+
     def take_kv_cache_block_copies(
-        self,
+        self, after_kv_load: bool = False
     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
-        """Drain pending copies and return their retained endpoints."""
+        """Drain pending copies and return their retained endpoints. With
+        `after_kv_load`, drain the copies whose sources KV-connector loads
+        write instead."""
         pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
         for mgr in self.coordinator.single_type_managers:
-            pending_copies.extend(mgr.take_pending_cow_copies())
+            if after_kv_load:
+                pending_copies.extend(mgr.take_pending_post_load_copies())
+            else:
+                pending_copies.extend(mgr.take_pending_cow_copies())
         copies = [
             KVCacheBlockCopy(
                 src_block_id=source_block.block_id,

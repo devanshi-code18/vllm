@@ -1409,6 +1409,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output.kv_cache_block_copies,
             )
 
+    def _copy_after_kv_loads(self, scheduler_output: SchedulerOutput) -> None:
+        """Run the copies that read blocks this step's KV-connector loads
+        write."""
+        if scheduler_output.kv_cache_block_copies_after_kv_load:
+            copy_kv_cache_blocks_inplace(
+                [*self.kv_caches, *self.replayssm_block_copy_tensors],
+                self.kv_cache_config.num_blocks,
+                scheduler_output.kv_cache_block_copies_after_kv_load,
+            )
+        self.model_state.copy_deferred_state()
+
     def gather_batch_req_state(
         self, scheduler_output: SchedulerOutput, dummy_run: bool
     ) -> tuple["BatchReqState | None", int | None]:
@@ -2180,7 +2191,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector.pre_forward(
                 scheduler_output, input_batch, attn_metadata=attn_metadata
             )
-            self.model_state.copy_deferred_state()
+            self._copy_after_kv_loads(scheduler_output)
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
@@ -2205,7 +2216,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_connector.pre_forward(
                     scheduler_output, input_batch, attn_metadata=attn_metadata
                 )
-                self.model_state.copy_deferred_state()
+                self._copy_after_kv_loads(scheduler_output)
                 if ubatch_state is not None:
                     assert self.ubatch_runner is not None
                     model_output = self.ubatch_runner.run(
