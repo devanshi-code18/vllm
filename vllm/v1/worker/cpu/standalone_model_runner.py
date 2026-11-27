@@ -1060,6 +1060,8 @@ class StandaloneCPUModelRunner(LoRAModelRunnerMixin):
                 block_tables,
                 self.kv_cache_config,
                 self.req_states.num_computed_tokens,
+                defer_copy=scheduler_output.has_sync_kv_loads
+                and self.kv_connector.defers_state_precopy,
             )
 
             if self.lora_config:
@@ -1148,6 +1150,7 @@ class StandaloneCPUModelRunner(LoRAModelRunnerMixin):
             is_padding=input_batch.is_padding,
         ):
             self.kv_connector.pre_forward(scheduler_output, input_batch)
+            self.model_state.copy_deferred_state()
             model_output = self.model(**model_inputs)
         self.kv_connector.finish_forward()
 

@@ -195,6 +195,17 @@ class KVConnectorBase_V1(ABC):
         """
         return False
 
+    @property
+    def loads_mamba_state_at_load_end(self) -> bool:
+        """Whether a sync load of a hybrid model's first `n` tokens writes the
+        Mamba state into the block holding token `n - 1` (column
+        `(n - 1) // block_size`), where the model computes from it, instead of
+        into the block the step's last token runs in. If True, the model runner
+        runs its prefix-caching state pre-copy after sync loads. Defaults to
+        False.
+        """
+        return False
+
     @classmethod
     def supports_lookahead_block_hashes(
         cls, kv_transfer_config: "KVTransferConfig"
