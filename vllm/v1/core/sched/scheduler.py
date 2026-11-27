@@ -294,6 +294,9 @@ class Scheduler(SchedulerInterface):
         # update_from_output.
         self.grammar_compile_error_reqs: dict[str, RequestError] = {}
         self.encoder_cache_mismatch_reqs: set[str] = set()
+        # Requests whose unrecomputable connector KV was lost; failed in
+        # update_from_output.
+        self.unrecomputable_kv_failed_reqs: dict[str, RequestError] = {}
         self._ec_metadata_resolver: PlaceholderMetadataResolver | None = None
 
         # Encoder-related.
@@ -1263,6 +1266,16 @@ class Scheduler(SchedulerInterface):
                             request.num_tokens - num_new_local_computed_tokens
                         )
                         connector_prefix_cache_hits = num_external_computed_tokens
+
+                        if request.num_unrecomputable_tokens and (
+                            self.prefix_replay_tokens
+                            or num_new_local_computed_tokens
+                            + num_external_computed_tokens
+                            < request.num_unrecomputable_tokens
+                        ):
+                            self._fail_unrecomputable_kv(request)
+                            skip_request(request_queue)
+                            continue
 
                     # Total computed tokens (local + external).
                     num_computed_tokens = (
@@ -2728,6 +2741,9 @@ class Scheduler(SchedulerInterface):
 
         request_errors = self.grammar_compile_error_reqs
         self.grammar_compile_error_reqs = {}
+        if self.unrecomputable_kv_failed_reqs:
+            request_errors.update(self.unrecomputable_kv_failed_reqs)
+            self.unrecomputable_kv_failed_reqs = {}
         error_req_ids = set(request_errors)
         error_req_ids.update(self.encoder_cache_mismatch_reqs)
         self.encoder_cache_mismatch_reqs.clear()
@@ -3218,6 +3234,9 @@ class Scheduler(SchedulerInterface):
                 if provenance is not None:
                     # Key the request's blocks apart from native KV.
                     request.kv_provenance = provenance.tag
+                    request.num_unrecomputable_tokens = (
+                        provenance.num_unrecomputable_tokens
+                    )
                     request.block_hashes.clear()
                     request.update_block_hashes()
                 # Before enqueueing: may_load_async can use what this records.
@@ -4035,11 +4054,28 @@ class Scheduler(SchedulerInterface):
                 and request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
             ):
                 affected_req_ids.add(req_id)
-                if self.recompute_kv_load_failures:
+                if request.num_unrecomputable_tokens:
+                    self._fail_unrecomputable_kv(request)
+                elif self.recompute_kv_load_failures:
                     request.num_computed_tokens = 0
                     self._refresh_queued_workload(request)
                     self.failed_recving_kv_req_ids.add(req_id)
         return set() if self.recompute_kv_load_failures else affected_req_ids
+
+    def _fail_unrecomputable_kv(self, request: Request) -> None:
+        if self.prefix_replay_tokens:
+            message = (
+                "KV a connector declares unrecomputable is not supported with "
+                "sliding-window bounded replay."
+            )
+        else:
+            message = (
+                "KV that prefill cannot rebuild is no longer in the prefix cache "
+                "or the KV connector."
+            )
+        self.unrecomputable_kv_failed_reqs[request.request_id] = RequestError(
+            code="kv_cache_lost", message=message, retryable=True
+        )
 
     def _handle_invalid_blocks(
         self, invalid_block_ids: set[int], num_scheduled_tokens: dict[str, int]
@@ -4094,6 +4130,21 @@ class Scheduler(SchedulerInterface):
         if not total_failed_requests:
             return set()
 
+        if not should_fail:
+            # Fail requests whose truncated prefix no longer covers the KV
+            # that prefill cannot rebuild, and drop their failed blocks.
+            for req_id in async_failed_req_ids | sync_failed_req_ids:
+                request = self.requests[req_id]
+                if request.num_computed_tokens >= request.num_unrecomputable_tokens:
+                    continue
+                self._fail_unrecomputable_kv(request)
+                total_failed_requests -= 1
+                async_failed_req_ids.discard(req_id)
+                if req_id in sync_failed_req_ids:
+                    (block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+                    first_failed = request.num_computed_tokens // self.block_size
+                    self.kv_cache_manager.evict_blocks(set(block_ids[first_failed:]))
+
         # evict invalid blocks and downstream dependent blocks from cache
         # only when not using recompute policy (where blocks will be recomputed
         # and reused by other requests sharing them)
@@ -4111,12 +4162,13 @@ class Scheduler(SchedulerInterface):
             )
             return all_failed_req_ids
 
-        logger.warning(
-            "Recovered from KV load failure: "
-            "%d request(s) rescheduled (%d tokens affected).",
-            total_failed_requests,
-            total_failed_tokens,
-        )
+        if total_failed_requests:
+            logger.warning(
+                "Recovered from KV load failure: "
+                "%d request(s) rescheduled (%d tokens affected).",
+                total_failed_requests,
+                total_failed_tokens,
+            )
 
         # Mark async requests with KV load failures for retry once loading completes
         self.failed_recving_kv_req_ids |= async_failed_req_ids

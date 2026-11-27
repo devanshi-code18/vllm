@@ -5599,6 +5599,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.aux_output_connector = None
     scheduler.grammar_compile_error_reqs = {}
     scheduler.encoder_cache_mismatch_reqs = set()
+    scheduler.unrecomputable_kv_failed_reqs = {}
     scheduler.dropped_streaming_updates = []
     scheduler.vllm_config = Mock()
     scheduler.return_sampling_mask = False
@@ -7023,6 +7024,7 @@ def test_prepend_skipped_requests_order():
 def test_remote_kv_promotion_drains_before_grammar_prefix():
     scheduler = create_scheduler(max_num_seqs=1)
     scheduler.connector = Mock()
+    scheduler.connector.get_kv_provenance.return_value = None
     scheduler.connector.get_num_new_matched_tokens.return_value = (0, False)
 
     requests = create_requests(num_requests=4)

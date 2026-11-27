@@ -5,10 +5,12 @@ from collections.abc import Callable
 
 import pytest
 
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVProvenance
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 
 from .utils import (
+    assert_scheduler_empty,
     create_mock_connector,
     create_model_runner_output,
     create_request,
@@ -394,3 +396,53 @@ def test_block_level_load_failure_fails_closed_with_multiple_groups():
 
     with pytest.raises(RuntimeError, match="failed_recving"):
         scheduler._handle_invalid_blocks({1}, {})
+
+
+@pytest.mark.parametrize("policy", ["fail", "recompute"])
+@pytest.mark.parametrize("async_load", [False, True])
+@pytest.mark.parametrize("invalid_block_idx", [1, 6])
+def test_load_failure_of_unrecomputable_kv(
+    policy: str, async_load: bool, invalid_block_idx: int
+):
+    """KV the connector declares unrecomputable for the first 4 blocks: a load
+    error inside them fails the request under any policy; one past them is
+    recomputed as usual under `recompute`."""
+    scheduler = create_scheduler(create_vllm_config(kv_load_failure_policy=policy))
+    block_size = scheduler.block_size
+    request = create_request(num_tokens=8 * block_size + 1)
+    scheduler.connector = create_mock_connector()
+    scheduler.connector.get_kv_provenance.return_value = KVProvenance(
+        "compressed", num_unrecomputable_tokens=4 * block_size
+    )
+    scheduler.connector.get_num_new_matched_tokens.return_value = (
+        8 * block_size,
+        async_load,
+    )
+    scheduler.connector.get_loaded_kv_cache_group_ids.return_value = (0,)
+    scheduler.connector.request_finished.return_value = (False, None)
+    scheduler.connector.take_events.return_value = ()
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    (block_ids,) = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+
+    engine_outputs = scheduler.update_from_output(
+        output,
+        create_model_runner_output(
+            [] if async_load else [request],
+            finished_recving={request.request_id} if async_load else None,
+            invalid_block_ids={block_ids[invalid_block_idx]},
+            use_eos=False,
+        ),
+    )
+
+    if policy == "recompute" and invalid_block_idx == 6:
+        assert not request.is_finished()
+        assert request.num_computed_tokens == 6 * block_size
+        return
+    assert request.status == RequestStatus.FINISHED_ERROR
+    if policy == "recompute":
+        (error_output,) = engine_outputs[0].outputs
+        assert error_output.error is not None
+        assert error_output.error.code == "kv_cache_lost"
+    assert not scheduler.schedule().num_scheduled_tokens
+    assert_scheduler_empty(scheduler)

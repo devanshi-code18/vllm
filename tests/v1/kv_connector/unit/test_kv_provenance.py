@@ -121,6 +121,55 @@ def test_loaded_kv_is_reused_only_under_its_provenance(is_async: bool):
     )
 
 
+class UnrecomputableKVConnector(TaggedKVConnector):
+    """Declares the KV it loads unrecomputable."""
+
+    def get_kv_provenance(self, request: Request) -> KVProvenance | None:
+        return KVProvenance("compressed", num_unrecomputable_tokens=NUM_LOADED_TOKENS)
+
+
+KVConnectorFactory.register_connector(
+    UnrecomputableKVConnector.__name__, __name__, UnrecomputableKVConnector.__name__
+)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("connector_has_kv", [True, False])
+def test_unrecomputable_kv_is_never_prefilled(connector_has_kv: bool):
+    scheduler = create_scheduler(
+        create_vllm_config(
+            block_size=BLOCK_SIZE,
+            max_num_batched_tokens=1024,
+            kv_connector="UnrecomputableKVConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={"matched_tokens": 0, "is_async": False},
+        )
+    )
+    params = {"num_tokens": NUM_LOADED_TOKENS if connector_has_kv else 0}
+    request = create_request(num_tokens=NUM_LOADED_TOKENS + 1)
+    request.kv_transfer_params = params
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    if not connector_has_kv:
+        # Nothing covers the unrecomputable tokens at the first schedule.
+        assert request.request_id not in output.num_scheduled_tokens
+        scheduler.update_from_output(output, create_model_runner_output([]))
+        assert request.status == RequestStatus.FINISHED_ERROR
+        return
+    scheduler.update_from_output(
+        output, create_model_runner_output([request], use_eos=False)
+    )
+
+    # Preempt the request and drop its cached blocks, then lose the
+    # connector's KV: resuming must fail rather than prefill those tokens.
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    params["num_tokens"] = 0
+    output = scheduler.schedule()
+    assert request.request_id not in output.num_scheduled_tokens
+    scheduler.update_from_output(output, create_model_runner_output([]))
+    assert request.status == RequestStatus.FINISHED_ERROR
+
+
 def test_llm_native_request_misses_kv_loaded_under_a_provenance(tmp_path, monkeypatch):
     # Keep the engine in this process, where the test connector is registered.
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")

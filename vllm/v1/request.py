@@ -198,6 +198,8 @@ class Request:
         # Tag of the KV a connector supplies for this request when it is not
         # the model's own (`KVProvenance`); part of the first block's hash.
         self.kv_provenance: str | None = None
+        # `KVProvenance.num_unrecomputable_tokens`.
+        self.num_unrecomputable_tokens = 0
 
         # Multi-modal related
         self.mm_features = mm_features or []

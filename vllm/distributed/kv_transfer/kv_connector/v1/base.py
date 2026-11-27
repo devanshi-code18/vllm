@@ -110,6 +110,13 @@ class KVProvenance:
     """
 
     tag: str
+    num_unrecomputable_tokens: int = 0
+    """Leading tokens whose KV prefilling the request's tokens cannot rebuild
+    (e.g. a compressed cache whose prompt tokens are placeholders). vLLM
+    fails the request, rather than recompute them, whenever the prefix cache
+    and the connector do not cover them: at its first schedule, after a
+    preemption, and on a KV load error under any `kv_load_failure_policy`.
+    Not supported with sliding-window bounded replay."""
 
 
 class SupportsHMA(ABC):
