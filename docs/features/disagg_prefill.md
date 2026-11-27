@@ -49,6 +49,12 @@ Now supports 9 types of connectors:
   --kv-transfer-config '{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both"}'
   ```
 
+- **SpeculativeEncodingConnector**: serves documents whose KV cache was translated from another model by [speculative encoding](https://github.com/b10-tv/speculative-encoding); a request naming a published document loads its tokens' KV from a store instead of prefilling them. See the [Speculative Encoding Connector guide](speculative_encoding_connector.md).
+
+  ```bash
+  --kv-transfer-config '{"kv_connector":"SpeculativeEncodingConnector","kv_role":"kv_both","kv_connector_extra_config":{"store":"/tmp/se-store"}}'
+  ```
+
 ## Reusing prefill token ids on decode
 
 !!! note
