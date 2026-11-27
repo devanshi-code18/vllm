@@ -87,10 +87,7 @@ def test_requests_read_document_kv_from_store(tmp_path, tp, kv_cache_dtype):
             temperature=0.0, max_tokens=16, logprobs=5, extra_args=extra
         )
         outputs = llm.generate(
-            [
-                TokensPrompt(prompt_token_ids=p, cache_salt=f"{key}-{i}")
-                for i, p in enumerate(prompts)
-            ],
+            [TokensPrompt(prompt_token_ids=p) for p in prompts],
             params,
         )
         return outputs, [
@@ -98,11 +95,15 @@ def test_requests_read_document_kv_from_store(tmp_path, tp, kv_cache_dtype):
             for o in outputs
         ]
 
-    native, native_results = generate(None)
     stored, stored_results = generate("lease")
+    # Same tokens as the requests above: their translated blocks must not hit.
+    native, native_results = generate(None)
     _, zeros_results = generate("zeros")
 
-    assert [o.num_cached_tokens for o in native] == [0] * len(prompts)
+    # The first native request finds nothing cached: the translated blocks of
+    # the same tokens are keyed under the document's provenance. (The others
+    # share its native blocks.)
+    assert native[0].num_cached_tokens == 0
     assert [o.num_cached_tokens for o in stored] == [len(document)] * len(prompts)
     check_logprobs_close(
         outputs_0_lst=native_results,

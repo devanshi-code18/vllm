@@ -60,7 +60,7 @@ def _config(store, **extra):
     )
 
 
-def _request(prompt, document="doc0", cache_salt="translated", request_id=None):
+def _request(prompt, document="doc0", cache_salt=None, request_id=None):
     init_none_hash(sha256)
     extra_args = {}
     if document is not None:
@@ -119,7 +119,6 @@ def _write_meta(store, key, text):
         "other_prompt",
         "missing_document",
         "deleted_document",
-        "no_cache_salt",
         "no_params",
         "path_key",
         "key_is_a_file",
@@ -146,8 +145,6 @@ def test_prefills_when_document_does_not_apply(tmp_path, case):
         kwargs["document"] = "doc1"
     elif case == "deleted_document":
         (tmp_path / "doc0" / "kv.safetensors").unlink()
-    elif case == "no_cache_salt":
-        kwargs["cache_salt"] = None
     elif case == "no_params":
         kwargs["document"] = None
     elif case == "path_key":
@@ -175,11 +172,24 @@ def test_prefills_when_document_does_not_apply(tmp_path, case):
     assert scheduled == len(prompt)
 
 
-def test_cache_salt_can_be_optional(tmp_path):
+def test_translated_blocks_never_serve_native_requests(tmp_path):
     _publish(tmp_path)
-    scheduler = create_scheduler(_config(tmp_path, require_cache_salt=False))
-    _, _, loads = _schedule_one(scheduler, _request(DOCUMENT + [7], cache_salt=None))
+    scheduler = create_scheduler(_config(tmp_path))
+    prompt = DOCUMENT + [7, 8]
+    _, _, loads = _schedule_one(scheduler, _request(prompt, request_id="translated"))
     assert len(loads) == 1
+    # Same tokens, no document: no prefix hit on the translated blocks.
+    native = _request(prompt, document=None, request_id="native")
+    _, scheduled, loads = _schedule_one(scheduler, native)
+    assert loads == []
+    assert scheduled == len(prompt)
+    # A second request on the document reuses its full blocks from the prefix
+    # cache and loads only the rest.
+    _, scheduled, loads = _schedule_one(scheduler, _request(prompt, request_id="again"))
+    assert [(load.start, load.end) for load in loads] == [
+        (3 * BLOCK_SIZE, len(DOCUMENT))
+    ]
+    assert scheduled == len(prompt) - len(DOCUMENT)
 
 
 def _corrupt(store, case):
@@ -209,7 +219,9 @@ def test_failed_load_spares_shared_prefix_blocks(tmp_path, case):
     _publish(tmp_path)
     config = _config(tmp_path)
     scheduler = create_scheduler(config)
-    shared = _request(DOCUMENT[:48] + [1, 2, 3], document=None, request_id="shared")
+    # Another request on the document: its full blocks are prefix-cache hits
+    # for the next one.
+    shared = _request(DOCUMENT + [1, 2, 3], request_id="shared")
     output, _, _ = _schedule_one(scheduler, shared)
     scheduler.update_from_output(output, create_model_runner_output([shared]))
 

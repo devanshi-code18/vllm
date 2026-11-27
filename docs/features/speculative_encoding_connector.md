@@ -27,11 +27,15 @@ vllm serve Qwen/Qwen3-14B --tensor-parallel-size 2 \
 `kv_connector_extra_config`:
 
 - `store` (required): the store directory, readable by the scheduler and every worker.
-- `require_cache_salt` (default `true`): load only for requests that set `cache_salt`. Translated KV is approximate, so give translated requests a salt that only translated requests use: their blocks then never serve requests that prefill the same tokens themselves.
+
+Translated KV is approximate, so the connector declares its provenance for each request that loads a document: those requests' prefix-cache blocks are kept apart from natively prefilled ones, and only requests on the same document reuse them.
+
+!!! warning
+    `LMCacheMPConnector` keys its store on tokens and `cache_salt`, not on provenance. Until it does, either keep it out of a `MultiConnector` with this connector, or give translated requests a `cache_salt` that only translated requests use; otherwise LMCache can serve translated KV to native requests.
 
 ## Request
 
-Put the document text in the system message, name the document in `kv_transfer_params`, and set a salt used only for translated requests:
+Put the document text in the system message and name the document in `kv_transfer_params`:
 
 ```python
 from openai import OpenAI
@@ -46,13 +50,12 @@ response = client.chat.completions.create(
     stream=True,
     extra_body={
         "kv_transfer_params": {"speculative_encoding": {"document": key}},
-        "cache_salt": f"{tenant_salt}:translated:{key}",
         "chat_template_kwargs": {"enable_thinking": False},
     },
 )
 ```
 
-The scheduler loads the document only when the request's prompt starts with the token ids the document was published for, and the document was published for a model with this model's KV heads and head size. Otherwise, or if the document is missing or unreadable, the request is prefilled normally and the connector logs a warning. The last prompt token is always computed. Later requests with the same `cache_salt` reuse the loaded blocks from the prefix cache. See [query_document.py](../../examples/disaggregated/speculative_encoding/query_document.py) and, for the whole flow on a laptop CPU with tiny random models, [quickstart_cpu.py](../../examples/disaggregated/speculative_encoding/quickstart_cpu.py).
+The scheduler loads the document only when the request's prompt starts with the token ids the document was published for, and the document was published for a model with this model's KV heads and head size. Otherwise, or if the document is missing or unreadable, the request is prefilled normally and the connector logs a warning. The last prompt token is always computed. Later requests on the same document (and with the same `cache_salt`, if any) reuse the loaded blocks from the prefix cache. See [query_document.py](../../examples/disaggregated/speculative_encoding/query_document.py) and, for the whole flow on a laptop CPU with tiny random models, [quickstart_cpu.py](../../examples/disaggregated/speculative_encoding/quickstart_cpu.py).
 
 ## Store format
 

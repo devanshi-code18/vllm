@@ -47,9 +47,6 @@ def main():
     if args.tenant_salt:
         extra_body["cache_salt"] = args.tenant_salt
     if not args.native:
-        # Translated KV is approximate: a salt only translated requests use keeps
-        # their blocks apart from natively prefilled ones.
-        extra_body["cache_salt"] = f"{args.tenant_salt}:translated:{key}"
         extra_body["kv_transfer_params"] = {"speculative_encoding": {"document": key}}
     started = time.perf_counter()
     first = None

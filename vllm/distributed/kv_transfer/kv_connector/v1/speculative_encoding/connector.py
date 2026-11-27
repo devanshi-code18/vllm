@@ -32,6 +32,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVProvenance,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding.reader import (  # noqa: E501
     StagedReader,
@@ -88,9 +89,9 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
     `kv_connector_extra_config`:
         store: The store directory (required), readable by the scheduler and
             every worker.
-        require_cache_salt: Load only for requests with a `cache_salt`
-            (default True). Use a salt only for translated requests, so their
-            blocks never serve requests that prefill the same tokens.
+
+    Translated KV is approximate, so requests that load a document declare its
+    provenance: their blocks are cached apart from natively prefilled ones.
     """
 
     def __init__(
@@ -109,9 +110,6 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
                 '["store"], the translated document store directory'
             )
         self._store = Path(store)
-        self._require_salt = bool(
-            self._kv_transfer_config.get_from_extra_config("require_cache_salt", True)
-        )
         # A failed load is reported by block id, which the scheduler can map
         # back to requests only with a single KV cache group.
         speculative = vllm_config.speculative_config
@@ -214,17 +212,18 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
                     found.key,
                     found.num_tokens,
                 )
-            elif self._require_salt and request.cache_salt is None:
-                self._skip(
-                    "salt",
-                    "request %s names a translated document but has no "
-                    "cache_salt (set require_cache_salt=false to load anyway)",
-                    request.request_id,
-                )
             else:
                 document = found
         self._matches[request.request_id] = document
         return document
+
+    def get_kv_provenance(self, request: "Request") -> KVProvenance | None:
+        document = self._match(request)
+        if document is None:
+            return None
+        return KVProvenance(
+            f"speculative_encoding:{document.provenance}:{document.key}"
+        )
 
     def _num_tokens(self, request: "Request", document: StoredDocument) -> int:
         # The last prompt token is computed to sample the first output token.
