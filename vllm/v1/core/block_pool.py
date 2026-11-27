@@ -171,6 +171,8 @@ class BlockPool:
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
+        # PoC state image tier (vllm/v1/core/state_image_tier.py), or None.
+        self.sit = None
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -700,6 +702,10 @@ class BlockPool:
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
+            if self.sit is not None:
+                for block in ret:
+                    if block.block_hash is not None:
+                        self.sit.on_evict(block, None)
             if self.metrics_collector:
                 for block in ret:
                     self._maybe_evict_cached_block(block)
@@ -760,6 +766,8 @@ class BlockPool:
             if block.ref_cnt == 0 and block.prev_free_block is not None:
                 self.free_block_queue.remove(block)
                 moved.append(block)
+                if self.sit is not None:
+                    self.sit.on_deprioritize(block)
         self.free_block_queue.insert_before_cached(moved)
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
@@ -802,6 +810,8 @@ class BlockPool:
             if block.ref_cnt == 0:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
+            if self.sit is not None:
+                self.sit.on_touch(block)
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 

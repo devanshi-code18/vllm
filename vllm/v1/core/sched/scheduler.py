@@ -398,6 +398,12 @@ class Scheduler(SchedulerInterface):
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
         )
+        from vllm.v1.core.state_image_tier import maybe_create_tier
+
+        self.sit = maybe_create_tier(kv_cache_config, self.kv_cache_manager.block_pool)
+        self._sit_group_block_sizes = [
+            g.block_size for g in kv_cache_config.kv_cache_groups
+        ]
         # Mamba managers already account for their speculative state blocks.
         num_spec_decode_tokens = (
             1 + self.num_spec_tokens + self.num_lookahead_tokens
@@ -1165,6 +1171,12 @@ class Scheduler(SchedulerInterface):
                         if self.aux_output_connector is not None
                         else None
                     )
+                    if self.sit is not None:
+                        self.sit.promote(
+                            request,
+                            self.kv_cache_manager.block_pool,
+                            self._sit_group_block_sizes,
+                        )
                     (
                         new_computed_blocks,
                         num_new_local_computed_tokens,
@@ -1806,6 +1818,11 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
+            state_tier_ops=(
+                self.sit.take_ops()
+                if self.sit is not None and total_num_scheduled_tokens > 0
+                else None
+            ),
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             skip_drafts=not drafts_needed,

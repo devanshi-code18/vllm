@@ -880,6 +880,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_caches = [
             cache for cache in kv_caches_dict.values() if cache.device == self.device
         ]
+        from vllm.v1.core.state_image_tier import sit_cpu_bytes
+
+        self.sit_worker = None
+        if sit_cpu_bytes() > 0 and not is_profiling:
+            from vllm.v1.worker.state_image_tier_worker import StateTierWorker
+
+            self.sit_worker = StateTierWorker(self.kv_cache_config)
         self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
         self.replayssm_block_copy_tensors = get_replayssm_block_copy_tensors(
             self.compilation_config.static_forward_context
@@ -1394,11 +1401,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             out=self.req_states.num_computed_prefill_tokens,
         )
 
+        sit_ops = scheduler_output.state_tier_ops
+        sit_worker = getattr(self, "sit_worker", None)
+        if sit_ops is not None and sit_worker is not None:
+            sit_worker.run_stores(sit_ops)
+
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
             assert self.kv_block_zeroer is not None
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+
+        if sit_ops is not None and sit_worker is not None:
+            sit_worker.run_loads(sit_ops)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.

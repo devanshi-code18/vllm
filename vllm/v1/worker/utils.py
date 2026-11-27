@@ -622,6 +622,9 @@ def allocate_kv_cache(
         buf = allocate(raw_size)
     else:
         buf = _allocate_kv_cache_buffer(raw_size, device)
+    from vllm.v1.worker.state_image_tier_worker import record_kv_buffer
+
+    record_kv_buffer(buf)
 
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:

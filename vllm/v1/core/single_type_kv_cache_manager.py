@@ -2648,12 +2648,11 @@ class MambaManager(SingleTypeKVCacheManager):
         else:
             tips[hit_hash] = _FALLBACK_TIP
             tips[tip_hash] = hit_hash
-            if (
-                prev is not None
-                and tips.pop(prev, None) is not None
-                and (stale := pool.get_cached_block(prev, gids))
-            ):
-                pool.deprioritize_blocks(stale)
+            if prev is not None and tips.pop(prev, None) is not None:
+                if pool.sit is not None:
+                    pool.sit.drop(prev, gids)
+                if stale := pool.get_cached_block(prev, gids):
+                    pool.deprioritize_blocks(stale)
 
         if len(tips) > pool.num_gpu_blocks:
             self._tips = {
