@@ -109,10 +109,17 @@ class ModelState(ABC):
         block_tables: tuple[torch.Tensor, ...],
         kv_cache_config: KVCacheConfig,
         num_computed_tokens: torch.Tensor,
+        defer_copy: bool = False,
     ) -> None:
         """Hook run on real batches before the forward pass (after block tables
         are gathered). Used by mamba prefix caching to pre-copy state
-        across block boundaries. No-op by default."""
+        across block boundaries. With `defer_copy`, the copy waits for
+        `copy_deferred_state`, after sync KV loads wrote the source blocks.
+        No-op by default."""
+        return None
+
+    def copy_deferred_state(self) -> None:
+        """Run the state copy `preprocess_state(defer_copy=True)` held back."""
         return None
 
     @abstractmethod

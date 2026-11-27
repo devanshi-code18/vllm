@@ -399,6 +399,8 @@ class Scheduler(SchedulerInterface):
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
         )
+        if self.connector is not None and self.connector.loads_mamba_state_at_load_end:
+            self.kv_cache_manager.enable_loaded_state_caching()
         # Mamba managers already account for their speculative state blocks.
         num_spec_decode_tokens = (
             1 + self.num_spec_tokens + self.num_lookahead_tokens
@@ -1773,12 +1775,18 @@ class Scheduler(SchedulerInterface):
         kv_cache_block_copies, cow_retained_blocks = (
             self.kv_cache_manager.take_kv_cache_block_copies()
         )
-        if kv_cache_block_copies:
+        post_load_copies, post_load_retained_blocks = (
+            self.kv_cache_manager.take_kv_cache_block_copies(after_kv_load=True)
+        )
+        if kv_cache_block_copies or post_load_copies:
             # The copies run with this step's execution; the first non-empty
             # step at or after it gets seq `sched_step_seq + 1` (0-token steps
             # do not advance the seq), and its completion implies the copies
             # have run.
-            self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
+            self._free_cow_retained_blocks(
+                cow_retained_blocks + post_load_retained_blocks,
+                self.sched_step_seq + 1,
+            )
         pending_kv_cache_block_copies = kv_cache_block_copies or None
 
         # Dynamic speculative decoding: compute optimal K
@@ -1811,6 +1819,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
+            kv_cache_block_copies_after_kv_load=post_load_copies or None,
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             skip_drafts=not drafts_needed,

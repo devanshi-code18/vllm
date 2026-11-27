@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
@@ -320,6 +320,9 @@ class SchedulerOutput:
 
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
+    # Copies whose sources this step's KV-connector loads write: applied after
+    # the loads and before forward.
+    kv_cache_block_copies_after_kv_load: list[KVCacheBlockCopy] | None = None
 
     # Scheduler-local; always None by the time this reaches a worker.
     kv_connector_block_state: KVConnectorBlockState | None = None
@@ -356,6 +359,15 @@ class SchedulerOutput:
         return not self.num_scheduled_tokens.keys().isdisjoint(
             other.num_scheduled_tokens
         )
+
+    def block_copy_dst_ids(self) -> Iterator[int]:
+        """Destination block ids of every block copy this step runs."""
+        for copies in (
+            self.kv_cache_block_copies,
+            self.kv_cache_block_copies_after_kv_load,
+        ):
+            for copy in copies or ():
+                yield copy.dst_block_id
 
 
 @dataclass(slots=True)

@@ -1499,7 +1499,7 @@ class MoRIIOConnectorScheduler:
             return False
         stream_written_block_ids = {
             *(scheduler_output.new_block_ids_to_zero or ()),
-            *(c.dst_block_id for c in scheduler_output.kv_cache_block_copies or ()),
+            *scheduler_output.block_copy_dst_ids(),
         }
         if not read_dst_block_ids.isdisjoint(stream_written_block_ids):
             return True

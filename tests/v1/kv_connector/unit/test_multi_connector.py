@@ -116,12 +116,14 @@ class MockHMAConnector(KVConnectorBase_V1, SupportsHMA):
     """Mock connector that supports HMA for testing."""
 
     _supports_divergent_local_hybrid_hits = False
+    _loads_mamba_state_at_load_end = False
 
     def __new__(cls, *args, **kwargs):
         mock = MagicMock(spec_set=cls)
         mock.supports_divergent_local_hybrid_hits = (
             cls._supports_divergent_local_hybrid_hits
         )
+        mock.loads_mamba_state_at_load_end = cls._loads_mamba_state_at_load_end
         mock.get_kv_connector_stats.return_value = None
         return mock
 
@@ -166,6 +168,10 @@ class LookaheadHashingTestConnector(ExampleConnector):
 
 class MockDivergentHMAConnector(MockHMAConnector):
     _supports_divergent_local_hybrid_hits = True
+
+
+class MockStateAtLoadEndHMAConnector(MockHMAConnector):
+    _loads_mamba_state_at_load_end = True
 
 
 @dataclass
@@ -1494,6 +1500,20 @@ def test_divergent_local_hybrid_hit_capability_is_conservative():
 
     mixed = _make_multi_connector(["MockDivergentHMAConnector", "MockHMAConnector"])
     assert mixed.supports_divergent_local_hybrid_hits is False
+
+
+def test_mamba_state_at_load_end_capability_is_conservative():
+    """A child that writes loaded state into the running block (MoRIIO READ)
+    keeps the model runner's state pre-copy before the loads."""
+    all_opt_in = _make_multi_connector(
+        ["MockStateAtLoadEndHMAConnector", "MockStateAtLoadEndHMAConnector"]
+    )
+    assert all_opt_in.loads_mamba_state_at_load_end is True
+
+    mixed = _make_multi_connector(
+        ["MockStateAtLoadEndHMAConnector", "MockHMAConnector"]
+    )
+    assert mixed.loads_mamba_state_at_load_end is False
 
 
 @pytest.mark.cpu_test
