@@ -70,9 +70,14 @@ from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
 # in a prefill from position 0. FA4 picks per launch how many query tiles a
 # CTA holds and, per tile and key block, the masking and the exp2
 # implementation, so a query's bits otherwise follow where its request's query
-# (a prefix-cache hit's tail, a chunk, a verify block) starts and what shares
-# the launch.
+# (a prefix-cache hit's tail, a chunk) starts and what shares the launch.
+# Decode and verify rows run `rel_decode_attention`, which reproduces these
+# bits.
 _FA4_TILE_ROWS = 128
+
+
+def _aligned_fa4_tiles() -> bool:
+    return envs.VLLM_BATCH_INVARIANT and use_sm100_kernels()
 
 
 @dataclass
@@ -81,7 +86,8 @@ class Inkling2AttentionMetadata(FlashAttentionMetadata):
     query_lens_cpu: np.ndarray = field(default_factory=lambda: np.empty(0, np.int64))
     seq_lens_cpu: np.ndarray = field(default_factory=lambda: np.empty(0, np.int64))
     # Batch-invariant mode on SM100: FA4's `(cu_seqlens_q, seq_lens,
-    # block_table)` with each position-aligned query tile as a request.
+    # block_table)` for the requests after the decodes, with each
+    # position-aligned query tile as a request.
     fa4_tiles: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
 
@@ -97,17 +103,17 @@ class Inkling2AttentionMetadataBuilder(FlashAttentionMetadataBuilder):
     def _fa4_tiles(
         self, md: Inkling2AttentionMetadata
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        """FA4 arguments with each 128-position query tile of each request as
-        its own request, in persistent buffers (full CUDA graphs read them).
-        A request of q queries has at most `cdiv(q, 128) + 1` tiles; it is
-        given `max(cdiv(q, 128), 1) + 1`, so that a padded decode batch
-        launches as many as the batch it was captured with, and unused
-        tiles are empty."""
-        # The queries of query_start_loc (with any CUDA-graph padding).
-        num_tokens = int(md.query_lens_cpu.sum())
+        """FA4 arguments for the requests after the first
+        `md.num_decode_reqs`, with each 128-position query tile of each
+        request as its own request, in persistent buffers. A request of q
+        queries has at most `cdiv(q, 128) + 1` tiles; it is given
+        `max(cdiv(q, 128), 1) + 1`, and unused tiles are empty."""
+        first = md.num_decode_reqs
+        query_lens_cpu = md.query_lens_cpu[first:]
+        num_tokens = int(query_lens_cpu.sum())
         if num_tokens == 0:
             return None
-        tiles_per_req = np.maximum(-(-md.query_lens_cpu // _FA4_TILE_ROWS), 1) + 1
+        tiles_per_req = np.maximum(-(-query_lens_cpu // _FA4_TILE_ROWS), 1) + 1
         num_tiles = int(tiles_per_req.sum())
         if self._tile_buffers is None:
             sched = self.vllm_config.scheduler_config
@@ -124,18 +130,19 @@ class Inkling2AttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             )
         cu_buf, seq_buf, table_buf = self._tile_buffers
         assert num_tiles + 2 <= cu_buf.shape[0]
-        query_start = md.query_start_loc
+        query_start = md.query_start_loc[first:] - md.num_decode_tokens
         query_lens = query_start.diff()
         num_reqs = query_lens.shape[0]
+        req_seq_lens = md.seq_lens[first:]
         tokens = torch.arange(num_tokens, dtype=torch.int32, device=query_start.device)
         reqs = torch.repeat_interleave(
             torch.arange(num_reqs, dtype=torch.int32, device=query_start.device),
             query_lens,
             output_size=num_tokens,
         )
-        first = query_start[reqs]
-        pos = md.seq_lens[reqs] - query_lens[reqs] + (tokens - first)
-        starts = (tokens == first) | (pos % _FA4_TILE_ROWS == 0)
+        req_start = query_start[reqs]
+        pos = req_seq_lens[reqs] - query_lens[reqs] + (tokens - req_start)
+        starts = (tokens == req_start) | (pos % _FA4_TILE_ROWS == 0)
         tile = torch.cumsum(starts, 0, dtype=torch.int32) - 1
         # Tile starts land at their index; other tokens in a spare slot.
         cu = cu_buf[: num_tiles + 2]
@@ -146,7 +153,9 @@ class Inkling2AttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         seq_lens = seq_buf[:num_tiles]
         seq_lens.copy_(torch.where(cu[1:] > cu[:-1], pos[last] + 1, 0))
         block_table = table_buf[:num_tiles]
-        block_table.copy_(md.block_table[reqs[cu[:-1].clamp(max=num_tokens - 1)]])
+        block_table.copy_(
+            md.block_table[first:][reqs[cu[:-1].clamp(max=num_tokens - 1)]]
+        )
         return cu, seq_lens, block_table
 
     def build(
@@ -171,7 +180,7 @@ class Inkling2AttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         ) = split_decodes_and_prefills(
             common_attn_metadata, decode_threshold=self.reorder_batch_threshold
         )
-        if envs.VLLM_BATCH_INVARIANT and use_sm100_kernels():
+        if _aligned_fa4_tiles():
             md.fa4_tiles = self._fa4_tiles(md)
         return md
 
@@ -553,7 +562,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 clip_threshold=self.qk_clip,
                 rel_threshold=self.rel_clip,
                 norm_eps=self.eps,
-                aligned_tiles=md.fa4_tiles is not None,
+                aligned_tiles=_aligned_fa4_tiles(),
             )
         if decode_splits:
             assert md is not None
@@ -712,12 +721,10 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             cache_seqlens = md.seq_lens[num_decodes:]
             max_query_len = md.max_query_len
         else:
-            # Batch-invariant mode runs every query here (see
-            # plan_decode_attention), each position-aligned tile a request.
-            # A fixed bound: tml_fa4 picks a CTA's query tiles from
-            # max_seqlen_q times the q heads per KV head, so every launch
-            # takes two-tile CTAs, each request in a CTA's first tile.
-            assert num_decodes == 0
+            # Each position-aligned tile a request, and a fixed bound:
+            # tml_fa4 picks a CTA's query tiles from max_seqlen_q times the q
+            # heads per KV head, so every launch takes two-tile CTAs, each
+            # request in a CTA's first tile.
             cu_seqlens_q, cache_seqlens, block_table = md.fa4_tiles
             max_query_len = _FA4_TILE_ROWS
         _INKLING2_FA4_REL_ATTENTION_KERNEL(

@@ -380,6 +380,12 @@ _VERIFY_BLOCK_M = 64
 _VERIFY_STAGES = 3
 
 
+def _fa4_order() -> bool:
+    """Batch-invariant mode on SM100: decode and verify rows take FA4's bits
+    (see `_verify_softmax_fa4`), as the prefill of the same tokens would."""
+    return envs.VLLM_BATCH_INVARIANT and use_sm100_kernels()
+
+
 def plan_decode_attention(
     is_local: bool,
     num_reqs: int,
@@ -403,11 +409,9 @@ def plan_decode_attention(
     if max_query_len > _VERIFY_BLOCK_M // (num_heads // num_kv_heads):
         return 0
     if envs.VLLM_BATCH_INVARIANT:
-        # One split: every request reads its keys in one order, as in prefill.
-        # SM100 prefills on FA4, whose bits this kernel does not reproduce, so
-        # there every query takes FA4 (else a prompt's last tokens would switch
-        # kernels on a prefix-cache hit).
-        return 0 if use_sm100_kernels() else 1
+        # One split: every request reads its keys in one order, as in prefill
+        # (on SM100, FA4's order; see `_verify_softmax_fa4`).
+        return 1
     work = num_reqs * num_kv_heads
     num_sms = num_compute_units()
     if is_local:
@@ -697,6 +701,193 @@ def _verify_mma(
 
 
 @gluon.jit
+def _fa4_row_sum(p, BLOCK_M: gl.constexpr):
+    """`sum(p, 1)` of fp32 `(BLOCK_M, 128)` in tml_fa4's order (`fadd_reduce`
+    on SM100): eight lane sums over the columns `k, k + 8, ..., k + 120` in
+    turn, then lanes `(0 + 2) + (4 + 6)` and `(1 + 3) + (5 + 7)`, then those
+    two. In 64-row tensor memory tiles a row's columns 64 and up sit in the
+    thread 16 lanes over, which continues the lower half's lane sums."""
+    # [rows, half, lane, j % 8] for column 64 half + 8 (j % 8) + lane
+    x = gl.permute(gl.reshape(p, [BLOCK_M, 2, 8, 8]), [0, 1, 3, 2])
+    q0, q1, q2, q3 = _split4(gl.reshape(x, [BLOCK_M, 2, 8, 2, 2, 2]))
+    v0, v4 = gl.split(q0)
+    v1, v5 = gl.split(q1)
+    v2, v6 = gl.split(q2)
+    v3, v7 = gl.split(q3)
+    acc = v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7
+    layout: gl.constexpr = acc.type.layout
+    half = gl.arange(0, 2, gl.SliceLayout(0, gl.SliceLayout(2, layout)))[None, :, None]
+    # The lower half's lane sums (plus an exact zero) in both threads.
+    lo = gl.sum(gl.where(half == 0, acc, 0.0), axis=1)[:, None, :]
+    acc = lo + v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7
+    l0, l1, l2, l3 = _split4(gl.reshape(acc, [BLOCK_M, 2, 2, 2, 2]))
+    e0, e1 = gl.split(l0 + l2)
+    o0, o1 = gl.split(l1 + l3)
+    total = (e0 + e1) + (o0 + o1)
+    t_layout: gl.constexpr = total.type.layout
+    half = gl.arange(0, 2, gl.SliceLayout(0, t_layout))[None, :]
+    return gl.sum(gl.where(half == 1, total, 0.0), axis=1)
+
+
+@gluon.jit
+def _split4(x):
+    """The four `[..., 2, 2] -> [...]` slices of `x`, in row-major order of
+    its last two dimensions."""
+    lo, hi = gl.split(x)
+    lo0, lo1 = gl.split(lo)
+    hi0, hi1 = gl.split(hi)
+    return lo0, hi0, lo1, hi1
+
+
+@gluon.jit
+def _verify_softmax_fa4(
+    s_tmem,
+    o_tmem,
+    s_ready,
+    p_ready,
+    o_done,
+    o_final,
+    Rel,
+    Gate,
+    Sink,
+    Y,
+    stride_gate,
+    stride_sink,
+    stride_rel_t,
+    q_start,
+    q_len,
+    past,
+    kv_head,
+    n_top,
+    num_iters,
+    inv_scale,
+    scale_log2,
+    H: gl.constexpr,
+    G: gl.constexpr,
+    D: gl.constexpr,
+    REL_PAD: gl.constexpr,
+    IS_LOCAL: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    WINDOW: gl.constexpr,
+):
+    """Online softmax with tml_fa4's bits for batch-invariant mode (FA4 with
+    one split, two 128-row query stages per CTA, and each query tile one
+    block of 128 positions, as `Inkling2AttentionMetadataBuilder` hands it).
+
+    A row at position `pos` in key block `b` sees blocks `b, b - 1, ...`, in
+    that order: block `b` with hardware exp2 and the causal mask, the blocks
+    below with the ex2 emulation columns, except, in window layers, those
+    below `cdiv(256 + 128 b - (WINDOW - 1), 128)`. The bias goes in as
+    `fma(bias, 1 / scale, qk)`, row maxima are rescaled lazily (threshold
+    8), row sums follow `_fa4_row_sum`, and the LSE is
+    `fma(max, scale_log2, lg2(sum)) * ln 2`. Keys of blocks a row's tile
+    would not visit are masked, which leaves its state unchanged. The
+    output is `gate_sink` of FA4's fp32 output and LSE.
+    """
+    num_warps: gl.constexpr = gl.num_warps()
+    s_layout: gl.constexpr = s_tmem.index(0).get_reg_layout(num_warps)
+    row_layout: gl.constexpr = gl.SliceLayout(1, s_layout)
+    O_CHUNK: gl.constexpr = 32
+    o_layout: gl.constexpr = o_tmem.slice(0, O_CHUNK).get_reg_layout(num_warps)
+    o_row_layout: gl.constexpr = gl.SliceLayout(1, o_layout)
+
+    rows = gl.arange(0, BLOCK_M, row_layout)
+    tok = rows // G
+    row_valid = (rows < BLOCK_M // G * G) & (tok < q_len)
+    pos = past + tok
+    block = pos // BLOCK_N
+    # The first valid row's block, and the first block a row emulates exp2
+    # in (window layers; tml_fa4's local-mask bound for a 256-row CTA tile).
+    block_lo = past // BLOCK_N
+    if IS_LOCAL:
+        emu_min = (256 + block * BLOCK_N - (WINDOW - 1) + BLOCK_N - 1) // BLOCK_N
+    offs_n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, s_layout))
+    emu_col = (offs_n // 32 % 3 != 0) & (offs_n % 16 >= 12)
+    head = kv_head * G + rows % G
+    token = (q_start + tok).to(gl.int64)
+    # Column `c` of a token's sheared logits holds key
+    # `c + (block + 1) * 128 - REL_PAD`.
+    rel_base = (block + 1) * BLOCK_N - REL_PAD
+    b_row = Rel + token * stride_rel_t + head * REL_PAD - rel_base
+
+    m_i = gl.full([BLOCK_M], float("-inf"), gl.float32, row_layout)
+    l_i = gl.full([BLOCK_M], 0.0, gl.float32, row_layout)
+    for i in range(num_iters):
+        n = n_top - i
+        key = n * BLOCK_N + offs_n
+        col = key[None, :] - rel_base[:, None]
+        bias = gl.load(
+            b_row[:, None] + key[None, :],
+            mask=row_valid[:, None] & (col >= 0) & (col < REL_PAD),
+            other=0.0,
+        )
+        _bw.mbarrier.wait(s_ready.index(i % 2), i // 2 & 1)
+        s = s_tmem.index(i % 2).load(s_layout)
+        # Below every row's table the bias is zero, which the FMA keeps exact.
+        if n >= block_lo - (REL_PAD // BLOCK_N - 1):
+            s = gl.fma(bias.to(gl.float32), inv_scale, s)
+        # Masks only where some row has keys right of it or past its window.
+        need_mask = n * BLOCK_N + BLOCK_N - 1 > past
+        if IS_LOCAL:
+            need_mask |= n * BLOCK_N <= past + q_len - 1 - WINDOW
+        if need_mask:
+            dist = pos[:, None] - key[None, :]
+            visible = dist >= 0
+            if IS_LOCAL:
+                visible &= dist < WINDOW
+            s = gl.where(visible, s, float("-inf"))
+
+        m_new = gl.maximum(m_i, gl.max(s, 1))
+        m_safe = gl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha_log2 = (m_i - m_safe) * scale_log2
+        keep = alpha_log2 >= -8.0
+        alpha = gl.where(keep, 1.0, _gl_ex2(alpha_log2))
+        m_use = gl.where(keep, m_i, m_safe)
+        m_i = gl.where(keep, m_i, m_new)
+        if i > 0 and gl.min(alpha, 0) < 1.0:
+            _bw.mbarrier.wait(o_done, i - 1 & 1)
+            alpha_o = gl.convert_layout(alpha, o_row_layout)[:, None]
+            for c in gl.static_range(D // O_CHUNK):
+                o_c = o_tmem.slice(c * O_CHUNK, O_CHUNK)
+                o_c.store(o_c.load(o_layout) * alpha_o)
+        x = gl.fma(s, scale_log2, -(m_use * scale_log2)[:, None])
+        emu = n < block
+        if IS_LOCAL:
+            emu &= n >= emu_min
+        p = gl.where(emu_col[None, :] & emu[:, None], _gl_ex2_emu(x), _gl_ex2(x))
+        _verify_p(s_tmem, i % 2, BLOCK_M, BLOCK_N).store(p.to(gl.bfloat16))
+        _bw.mbarrier.arrive(p_ready.index(i % 2), count=1)
+        # tml_fa4 adds the rescaled sum into lane 0 first.
+        init = l_i * alpha
+        p_sum = gl.where(offs_n[None, :] == 0, p + init[:, None], p)
+        l_i = gl.convert_layout(_fa4_row_sum(p_sum, BLOCK_M), row_layout)
+
+    empty = (l_i == 0.0) | (l_i != l_i)
+    lse = gl.where(
+        empty,
+        float("-inf"),
+        gl.fma(m_i, scale_log2, _gl_lg2(l_i)) * 0.6931471805599453,
+    )
+    inv_l = _gl_rcp(gl.where(empty, 1.0, l_i))
+    sink = gl.load(Sink + token * stride_sink + head, mask=row_valid, other=0.0)
+    sink_scale = _gl_sigmoid(lse - sink.to(gl.float32))
+    inv_l = gl.convert_layout(inv_l, o_row_layout)[:, None]
+    sink_scale = gl.convert_layout(sink_scale, o_row_layout)[:, None]
+    o_valid = gl.convert_layout(row_valid, o_row_layout)[:, None]
+    token_o = gl.convert_layout(token, o_row_layout)[:, None]
+    head_o = gl.convert_layout(head * D, o_row_layout)[:, None]
+    offs_d = gl.arange(0, O_CHUNK, gl.SliceLayout(0, o_layout))[None, :]
+    _bw.mbarrier.wait(o_final, 0)
+    for c in gl.static_range(D // O_CHUNK):
+        col = head_o + c * O_CHUNK + offs_d
+        gate = gl.load(Gate + token_o * stride_gate + col, mask=o_valid, other=0.0)
+        o = o_tmem.slice(c * O_CHUNK, O_CHUNK).load(o_layout) * inv_l
+        y = o * _gl_sigmoid(gate.to(gl.float32))
+        gl.store(Y + token_o * (H * D) + col, y * sink_scale, mask=o_valid)
+
+
+@gluon.jit
 def _verify_softmax(
     s_tmem,
     o_tmem,
@@ -892,6 +1083,8 @@ def _rel_verify_kernel(
     head_cols,
     num_splits,
     num_tokens,
+    inv_scale,
+    scale_log2,
     H: gl.constexpr,
     HKV: gl.constexpr,
     D: gl.constexpr,
@@ -906,6 +1099,7 @@ def _rel_verify_kernel(
     FUSE_GATE: gl.constexpr,
     DRAFT: gl.constexpr,
     WINDOW: gl.constexpr,
+    FA4_ORDER: gl.constexpr,
 ):
     """One split of one request and KV head: fp32 partial output, log2 LSE.
 
@@ -919,6 +1113,8 @@ def _rel_verify_kernel(
     `DRAFT` is plain block attention (the DSpark drafter): no relative
     logits, gate or sink, and every query of a request sits at its last
     position. Local layers see `WINDOW` keys up to a query's position.
+    `FA4_ORDER` (one split) walks the key blocks down from the last one and
+    reproduces tml_fa4's bits (`_verify_softmax_fa4`).
     """
     G: gl.constexpr = H // HKV
     split = gl.program_id(0)
@@ -944,6 +1140,15 @@ def _rel_verify_kernel(
     # Key of column 0 of the sheared relative logits.
     rel_base = gl.cdiv(seqlen_k, FA_BLOCK) * FA_BLOCK - REL_PAD
     num_iters = gl.maximum(gl.cdiv(gl.cdiv(seqlen_k, BLOCK_N) - n_first, num_splits), 0)
+    if FA4_ORDER:
+        # Block i is n_first - i, from the last key's block down to the
+        # first query's lowest block (window layers).
+        n_first = gl.cdiv(seqlen_k, BLOCK_N) - 1
+        n_last = 0
+        if IS_LOCAL:
+            n_last = gl.maximum((past - (WINDOW - 1)) // BLOCK_N, 0)
+        num_iters = gl.maximum(n_first + 1 - n_last, 0)
+        num_splits = -1
 
     smem_layout: gl.constexpr = gl.NVMMASharedLayout(
         swizzle_byte_width=128, element_bitwidth=16
@@ -988,10 +1193,16 @@ def _rel_verify_kernel(
     gl.barrier()
     # Key blocks before the new tokens were cached by earlier steps: load the
     # first of them while the producer of Q and the new keys (PDL) finishes.
-    num_old = gl.maximum(gl.cdiv(past // BLOCK_N - n_first, num_splits), 0)
-    num_pre = gl.minimum(gl.minimum(num_old, num_iters), STAGES)
+    if FA4_ORDER:
+        # Walking down, blocks from `first_old` on are old.
+        first_old = n_first - past // BLOCK_N + 1
+        num_pre = gl.minimum(num_iters, STAGES)
+    else:
+        first_old = 0
+        num_old = gl.maximum(gl.cdiv(past // BLOCK_N - n_first, num_splits), 0)
+        num_pre = gl.minimum(gl.minimum(num_old, num_iters), STAGES)
     for i in gl.static_range(STAGES):
-        if i < num_pre:
+        if i >= first_old and i < num_pre:
             _verify_load_block(
                 kv_desc,
                 k_smem,
@@ -1015,6 +1226,29 @@ def _rel_verify_kernel(
     gl.inline_asm_elementwise(
         "griddepcontrol.wait; // $0", "=r", [], dtype=gl.int32, is_pure=False, pack=1
     )
+    if FA4_ORDER:
+        for i in gl.static_range(STAGES):
+            if i < first_old and i < num_pre:
+                _verify_load_block(
+                    kv_desc,
+                    k_smem,
+                    v_smem,
+                    kv_ready,
+                    BlockTable,
+                    req,
+                    kv_head,
+                    stride_bt,
+                    n_first,
+                    num_splits,
+                    i,
+                    page_rows,
+                    head_rows,
+                    head_cols,
+                    PAGE,
+                    BLOCK_N,
+                    D,
+                    STAGES,
+                )
     q = gl.load(q_ptrs + offs_d[None, :], mask=row_valid[:, None], other=0.0)
     q_smem = gl.allocate_shared_memory(gl.bfloat16, [BLOCK_M, D], smem_layout, q)
     _bw.fence_async_shared()
@@ -1022,6 +1256,41 @@ def _rel_verify_kernel(
     gl.warp_specialize(
         [
             (
+                _verify_softmax_fa4,
+                (
+                    s_tmem,
+                    o_tmem,
+                    s_ready,
+                    p_ready,
+                    o_done,
+                    o_final,
+                    Rel,
+                    Gate,
+                    Sink,
+                    Y,
+                    stride_gate,
+                    stride_sink,
+                    stride_rel_t,
+                    q_start,
+                    q_len,
+                    past,
+                    kv_head,
+                    n_first,
+                    num_iters,
+                    inv_scale,
+                    scale_log2,
+                    H,
+                    G,
+                    D,
+                    REL_PAD,
+                    IS_LOCAL,
+                    BLOCK_M,
+                    BLOCK_N,
+                    WINDOW,
+                ),
+            )
+            if FA4_ORDER
+            else (
                 _verify_softmax,
                 (
                     s_tmem,
@@ -1234,7 +1503,9 @@ def _decode_attention(
     else:
         rel_logits, gate, sinks = rel_gate_sinks
         extent = rel_logits.shape[2] - 2 * _FA4_BLOCK_N
+    fa4_order = not draft and _fa4_order()
     assert max_query_len <= _VERIFY_BLOCK_M // group
+    assert not fa4_order or num_splits == 1
     assert key_cache.stride() == value_cache.stride() and key_cache.stride(3) == 1
     assert q.stride(1) == head_dim and q.stride(2) == 1
     assert out.is_contiguous()
@@ -1265,6 +1536,7 @@ def _decode_attention(
             window,
             num_splits,
             draft,
+            fa4_order,
         )
     else:
         rel_attention(
@@ -1333,6 +1605,7 @@ def _launch_rel_verify(
     window: int,
     num_splits: int,
     draft: bool,
+    fa4_order: bool,
 ) -> None:
     num_tokens, num_heads, head_dim = q.shape
     num_blocks, page, num_kv_heads = key_cache.shape[:3]
@@ -1378,6 +1651,9 @@ def _launch_rel_verify(
         head_cols,
         num_splits,
         num_tokens,
+        # tml_fa4's fp32 `1 / scale` and `scale * log2(e)`.
+        float(np.float32(1.0) / np.float32(softmax_scale)),
+        float(np.float32(softmax_scale) * np.float32(1.4426950408889634)),
         H=num_heads,
         HKV=num_kv_heads,
         D=head_dim,
@@ -1392,6 +1668,8 @@ def _launch_rel_verify(
         FUSE_GATE=fuse_gate,
         DRAFT=draft,
         WINDOW=window,
+        FA4_ORDER=fa4_order,
         num_warps=4,
+        enable_fp_fusion=not fa4_order,
         launch_pdl=True,
     )

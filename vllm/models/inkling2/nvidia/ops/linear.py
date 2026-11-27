@@ -17,6 +17,18 @@ from .ll_gemm_sm120 import sm12x_bf16_ll_gemm, use_sm12x_bf16_ll_gemm
 # Up to this many rows, FlashInfer's CuTe DSL low-M kernels run near HBM
 # bandwidth (cuBLAS is up to 2x slower); larger batches use cuBLAS.
 LOW_M_MAX_TOKENS = 32
+# Batch-invariant mode on SM100: weights of at most this many rows run the
+# reference K groups (batch invariant; at decode sizes faster than cuBLAS
+# without split-K), wider ones cuBLAS.
+BI_K_GROUPS_MAX_N = 4096
+
+
+def use_bi_k_groups(weight: torch.Tensor) -> bool:
+    return (
+        envs.VLLM_BATCH_INVARIANT
+        and use_sm100_kernels()
+        and weight.shape[0] <= BI_K_GROUPS_MAX_N
+    )
 
 
 def linear(
@@ -24,6 +36,9 @@ def linear(
 ) -> torch.Tensor:
     """bf16 `x @ weight.T` with fp32 accumulation (into `out` if given,
     batches over LOW_M_MAX_TOKENS only)."""
+    if use_bi_k_groups(weight):
+        y = linear_k_groups(x.contiguous(), weight, x.dtype)
+        return y if out is None else out.copy_(y)
     if out is not None:
         assert x.shape[0] > LOW_M_MAX_TOKENS
         return torch.mm(x, weight.t(), out=out)
@@ -58,10 +73,14 @@ def _k_group_tile(
     pid_n,
     pid_m,
     pid_k,
+    group_rows=None,
 ):
     # Row tiles of at most 64 keep tl.dot on the same mma.sync instruction
     # sequence as the reference's 16x32x32 tiling. With SPLIT, each program computes one
-    # K group's partial; otherwise it sums the groups in order.
+    # K group's partial (`group_rows` rows apart); otherwise it sums the groups
+    # in order.
+    if group_rows is None:
+        group_rows = M
     cols = pid_n * BN + tl.arange(0, BN)
     rows = pid_m * BM + tl.arange(0, BM)
     ks = tl.arange(0, 128)
@@ -97,7 +116,7 @@ def _k_group_tile(
             )
         total = partial if g == 0 else total + partial
     tl.store(
-        Y + (first * M + rows[:, None]) * N + cols[None, :],
+        Y + (first * group_rows + rows[:, None]) * N + cols[None, :],
         total.to(Y.dtype.element_ty),
         (rows[:, None] < M) & (cols[None, :] < N),
     )
@@ -152,6 +171,41 @@ def _k_group_kernel(
         tl.program_id(0),
         tl.program_id(1),
         tl.program_id(2),
+    )
+
+
+@triton.jit
+def _k_group_bmm_kernel(
+    X,
+    W,
+    Y,
+    M,
+    num_batches,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    GROUPS: tl.constexpr,
+    launch_pdl: tl.constexpr,
+):
+    # Batch b's K group g: its partial at rows `(g * num_batches + b) * M`.
+    b = tl.program_id(2) // GROUPS
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+    _k_group_tile(
+        X + b * M * K,
+        W + b * N * K,
+        Y + b * M * N,
+        M,
+        N,
+        K,
+        BM,
+        BN,
+        GROUPS > 1,
+        tl.program_id(0),
+        tl.program_id(1),
+        tl.program_id(2) % GROUPS,
+        num_batches * M,
     )
 
 
@@ -283,6 +337,57 @@ def k_group_partials(
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return out
+
+
+def bmm_k_groups(
+    x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
+    """`x[b] @ weight[b].T` for bf16 `x` [B, T, K] and `weight` [B, N, K], as
+    `linear_k_groups` (each 1024-wide K group in fp32, summed in order).
+    A row's result does not depend on T."""
+    assert x.is_contiguous() and weight.is_contiguous()
+    batches, tokens, hidden = x.shape
+    n = weight.shape[1]
+    groups = triton.cdiv(hidden, 1024)
+    block_m = 16 if tokens <= 128 else 64
+    block_n = 32 if tokens <= 16 else 64 if tokens <= 256 else 128
+    out = torch.empty(
+        (groups, batches, tokens, n),
+        dtype=torch.float32 if groups > 1 else out_dtype,
+        device=x.device,
+    )
+    if tokens == 0:
+        return out[0]
+    _k_group_bmm_kernel[
+        (triton.cdiv(n, block_n), triton.cdiv(tokens, block_m), batches * groups)
+    ](
+        x,
+        weight,
+        out,
+        tokens,
+        batches,
+        n,
+        hidden,
+        block_m,
+        block_n,
+        groups,
+        num_warps=4 if block_n <= 64 else 8,
+        num_stages=3 if block_n <= 64 else 2,
+        enable_fp_fusion=False,
+        launch_pdl=current_platform.is_arch_support_pdl(),
+    )
+    if groups == 1:
+        return out[0]
+    total = torch.empty(out.shape[1:], dtype=out_dtype, device=x.device)
+    _k_group_sum_kernel[(triton.cdiv(total.numel(), 1024),)](
+        out,
+        total,
+        total.numel(),
+        groups,
+        1024,
+        launch_pdl=current_platform.is_arch_support_pdl(),
+    )
+    return total
 
 
 def linear_k_groups(

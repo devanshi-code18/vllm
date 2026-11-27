@@ -26,7 +26,7 @@ from vllm.v1.attention.backend import AttentionBackend
 
 from .ops.allreduce import Inkling2AllReduceWorkspace, all_reduce_conv_mix
 from .ops.conv_mix import conv_mix as fused_conv_mix
-from .ops.linear import linear_k_groups
+from .ops.linear import linear_k_groups, use_bi_k_groups
 from .ops.ll_gemm_sm120 import sm12x_bf16_ll_gemm, use_sm12x_bf16_ll_gemm
 from .ops.sconv import short_conv
 from .ops.seq_parallel import SeqParallel
@@ -123,11 +123,10 @@ class Inkling2ShortConv(nn.Module):
         if not self.dynamic:
             return None
         # Same dispatch as the reference ``linear``: fp32 1024-wide K groups.
-        if self.weight_proj.shape[1] >= 2560 and self.weight_proj.shape[0] not in (
-            1,
-            2,
-            4,
-        ):
+        if (
+            self.weight_proj.shape[1] >= 2560
+            and self.weight_proj.shape[0] not in (1, 2, 4)
+        ) or use_bi_k_groups(self.weight_proj):
             return linear_k_groups(x.contiguous(), self.weight_proj, x.dtype)
         if use_sm12x_bf16_ll_gemm(x, self.weight_proj):
             return sm12x_bf16_ll_gemm(x, self.weight_proj)

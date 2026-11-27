@@ -20,6 +20,10 @@ requires_sm90 = pytest.mark.skipif(
     reason="Inkling2 attention requires Hopper or Blackwell",
 )
 
+requires_sm100 = pytest.mark.skipif(
+    _cap is None or _cap.major != 10, reason="requires SM100 (tml_fa4)"
+)
+
 HEAD_DIM = 128
 REL_EXTENT = 1024
 SCENARIOS = {
@@ -386,17 +390,129 @@ def test_inkling2_rel_decode_attention(
     assert (out[num_tokens:] == 0).all()
 
 
+@requires_sm100
+@pytest.mark.parametrize("is_local", [False, True])
+@pytest.mark.parametrize("block_size", [64, 128])
+@torch.inference_mode()
+def test_inkling2_rel_decode_attention_batch_invariant_fa4_bits(
+    is_local, block_size, monkeypatch
+):
+    """Under batch-invariant mode, decode and verify rows on the Gluon kernel
+    get the bits FA4 gives them in the prefill path (one split, each
+    128-position query tile its own request), gate and sink included, so a
+    token's output does not depend on which kernel runs it."""
+    from vllm import envs
+    from vllm.models.inkling2.nvidia.ops.attention import (
+        _INKLING2_FA4_REL_ATTENTION_KERNEL,
+        gate_sink,
+        rel_decode_attention,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    torch.manual_seed(0)
+    device = "cuda"
+    num_heads, num_kv_heads = 24, 8
+    # Decodes at block edges, verify blocks across a 128-position boundary,
+    # and the most queries the kernel takes (21 at 3 q heads per KV head).
+    query_lens = [1, 1, 1, 8, 8, 21, 15]
+    kv_lens = [1, 128, 2049, 1031, 133, 1100, 270]
+    seqs = list(zip(query_lens, kv_lens))
+    tiles, tile_reqs = [], []
+    for i, (q_len, kv_len) in enumerate(seqs):
+        pos = kv_len - q_len
+        while pos < kv_len:
+            end = min(kv_len, (pos // 128 + 1) * 128)
+            tiles.append((end - pos, end))
+            tile_reqs.append(i)
+            pos = end
+    num_tokens = sum(query_lens)
+    max_blocks = -(-max(kv_lens) // block_size)
+    num_blocks = len(seqs) * max_blocks + 1
+    kv = torch.randn(num_blocks, block_size, num_kv_heads, 2 * HEAD_DIM, device=device)
+    kv[..., :HEAD_DIM] = torch.nn.functional.normalize(kv[..., :HEAD_DIM], dim=-1) * 2
+    key_cache, value_cache = kv.bfloat16().split(HEAD_DIM, dim=-1)
+    block_table = (
+        (torch.randperm(num_blocks - 1, device=device) + 1)
+        .view(len(seqs), max_blocks)
+        .int()
+    )
+    q = torch.randn(num_tokens, num_heads, HEAD_DIM, device=device)
+    q = (torch.nn.functional.normalize(q, dim=-1) * 3).bfloat16()
+    rel_logits = torch.randn(
+        num_tokens, num_heads, REL_EXTENT, device=device, dtype=torch.bfloat16
+    )
+    width = num_heads * HEAD_DIM
+    proj = torch.randn(num_tokens, width + num_heads + 4, device=device).bfloat16()
+    gate, sinks = proj[:, :width], proj[:, width : width + num_heads]
+    rel_in = shear_rel_logits(rel_logits, tiles, 128, is_local)
+    scale = HEAD_DIM**-0.5
+
+    def cumsum(lens):
+        return torch.tensor([0, *lens], device=device).cumsum(0).int()
+
+    fa4_out = torch.empty(q.shape, device=device)
+    fa4_lse = torch.empty(q.shape[1::-1], device=device)
+    _INKLING2_FA4_REL_ATTENTION_KERNEL(
+        q,
+        key_cache,
+        value_cache,
+        block_table=block_table[torch.tensor(tile_reqs, device=device)],
+        cache_seqlens=torch.tensor([k for _, k in tiles], device=device).int(),
+        cu_seqlens_q=cumsum([n for n, _ in tiles]),
+        max_seqlen_q=bucket_max_seqlen_q(128),
+        softmax_scale=scale,
+        window_size=(REL_EXTENT - 1, 0) if is_local else (-1, -1),
+        sheared_bias=rel_in,
+        num_splits=1,
+        use_scheduler=False,
+        out=fa4_out,
+        lse=fa4_lse,
+    )
+    expected = torch.empty(gate.shape, device=device, dtype=torch.bfloat16)
+    gate_sink(fa4_out, gate, fa4_lse.t(), sinks, expected)
+
+    out = torch.full_like(expected, float("nan"))
+    rel_decode_attention(
+        q,
+        key_cache,
+        value_cache,
+        rel_in,
+        gate,
+        sinks,
+        out,
+        block_table=block_table,
+        cache_seqlens=torch.tensor(kv_lens, dtype=torch.int32, device=device),
+        cu_seqlens_q=cumsum(query_lens),
+        max_query_len=max(query_lens),
+        num_actual_tokens=num_tokens,
+        softmax_scale=scale,
+        is_local=is_local,
+        num_splits=1,
+    )
+    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+
+
 @requires_sm90
 @pytest.mark.parametrize("is_local", [False, True])
-@pytest.mark.parametrize("num_splits", [1, 9])
+@pytest.mark.parametrize(
+    "num_splits,batch_invariant", [(1, False), (9, False), (1, True)]
+)
 @torch.inference_mode()
-def test_inkling2_decode_attention_after_prologue(is_local, num_splits):
+def test_inkling2_decode_attention_after_prologue(
+    is_local, num_splits, batch_invariant, monkeypatch
+):
     """Back to back under PDL (CUDA graph replay), the decode kernel loads
     cached keys while the prologue still writes the new ones: it must match a
     run with the two launches serialized."""
+    from vllm import envs
+    from vllm.models.inkling2.nvidia.ops import use_sm100_kernels
     from vllm.models.inkling2.nvidia.ops.attention import rel_decode_attention
     from vllm.models.inkling2.nvidia.ops.sconv import attention_prologue, shift_rel_proj
 
+    if batch_invariant:
+        if not use_sm100_kernels():
+            pytest.skip("batch-invariant decode order is SM100's")
+        monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
     torch.manual_seed(0)
     device = "cuda"
     heads, kv_heads, d_rel, page = 12, 2, 16, 128
@@ -467,6 +583,7 @@ def test_inkling2_decode_attention_after_prologue(is_local, num_splits):
             clip_threshold=22.6,
             rel_threshold=8.0,
             norm_eps=1e-6,
+            aligned_tiles=batch_invariant,
         )
         if sync:
             torch.accelerator.synchronize()
