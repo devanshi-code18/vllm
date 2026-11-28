@@ -17,6 +17,22 @@ python examples/disaggregated/speculative_encoding/publish_document.py \
 
 It prints the document key, the SHA-256 of the stripped, NFC-normalized text. Translation runs in the producer, ahead of the requests that read the document.
 
+### On the same host: share from the GPU
+
+A producer that runs on the server's host can keep the K/V on its GPU instead: `share_document` (same arguments as `write_document`, K/V on a CUDA device) publishes only `meta.json`, with a CUDA IPC handle of the K/V. Each worker maps it on its own GPU (peer access over NVLink or PCIe), copies its heads device to device and unmaps it, so nothing goes through host memory or a file. Servers on other hosts prefill the document; every worker must run on the producer's host.
+
+```python
+from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding import (
+    share_document,
+)
+
+document = share_document(store, key, prompt_token_ids, kv)  # kv on the GPU
+...
+document.close()  # unpublish; frees the memory once no worker is reading it
+```
+
+The producer process must stay alive while the document is published. A worker holds a shared lock on the document's `meta.json` while it reads; `close()` unpublishes the document first, then waits for the lock before it frees the memory.
+
 ## Serve
 
 ```bash
@@ -63,6 +79,7 @@ One directory per document:
 
 - `<store>/<key>/meta.json`: `format` (`speculative-encoding-kv/1`), `prompt_token_ids` (the `N` tokens the KV covers), `num_layers`, `num_kv_heads`, `head_size`, `dtype`, `provenance`.
 - `<store>/<key>/kv.safetensors`: per layer, `layers.<i>` of shape `[2, num_kv_heads, N, head_size]`: post-RoPE K and V of all heads.
+- A shared document has no `kv.safetensors`: its `meta.json` adds `ipc`, the host's boot id and the CUDA IPC handle of one `[num_layers, 2, num_kv_heads, N, head_size]` tensor.
 
 `write_document` writes a document to a temporary directory and renames it into place, so readers never see a partial one, and refuses a key that is already published. Treat published documents as immutable: publish a changed translation under a new key. Keys may contain only letters, digits, `_`, `.` and `-`.
 

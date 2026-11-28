@@ -41,6 +41,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding.reader im
     local_kv_heads,
     split_ranges,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding.shared import (  # noqa: E501
+    host_id,
+    open_shared,
+    published_meta,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding.store import (  # noqa: E501
     StoredDocument,
     read_document,
@@ -183,7 +188,14 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
 
     def _document(self, key: str) -> StoredDocument | None:
         document = self._documents.get(key)
-        if document is not None and (self._store / key / document.file).is_file():
+        if (
+            document is not None
+            and (
+                self._store
+                / key
+                / ("meta.json" if document.shared_host else document.file)
+            ).is_file()
+        ):
             self._documents.move_to_end(key)
             return document
         self._documents.pop(key, None)
@@ -194,6 +206,9 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
             return None
         except (OSError, ValueError) as e:
             self._skip("invalid", "document %r is not readable: %s", key, e)
+            return None
+        if document.shared_host and document.shared_host != host_id():
+            self._skip("host", "document %r is shared from another host", key)
             return None
         if document.layer_inputs:
             if (document.num_layers, document.hidden_size) != self._input_geometry:
@@ -354,8 +369,14 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
             )
 
     def _load(self, load: DocumentLoad, layers: dict[str, Any]) -> None:
+        folder = self._store / load.key
+        with published_meta(folder) as meta:
+            # Read again: a shared document may have been replaced since.
+            if isinstance(meta.get("ipc"), dict):
+                self._write_shared(meta["ipc"], load, layers)
+                return
         file = "layer_inputs.safetensors" if load.layer_inputs else "kv.safetensors"
-        fd = os.open(self._store / load.key / file, os.O_RDONLY)
+        fd = os.open(folder / file, os.O_RDONLY)
         try:
             size = int.from_bytes(os.pread(fd, 8, 0), "little")
             header = json.loads(os.pread(fd, size, 8))
@@ -437,10 +458,7 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
             nbytes = sum(length for _, length in ranges)
             plans.append((layer, len(heads), nbytes, len(layer_pieces)))
             pieces.extend(layer_pieces)
-        positions = torch.arange(load.start, load.end, dtype=torch.int64)
-        blocks = torch.tensor(load.block_ids, dtype=torch.int64)
-        slots = blocks[positions // self._block_size] * self._block_size
-        slots += positions % self._block_size
+        slots = self._slots(load)
         slot_mapping = None
         staged = self._reader.read(fd, pieces)
         try:
@@ -467,6 +485,45 @@ class SpeculativeEncodingConnector(KVConnectorBase_V1):
                 )
         finally:
             staged.close()
+
+    def _write_shared(
+        self, ipc: dict[str, Any], load: DocumentLoad, layers: dict[str, Any]
+    ) -> None:
+        num_kv_heads, head_size = self._geometry
+        shape = [2, num_kv_heads, load.num_tokens, head_size]
+        if ipc.get("shape", [])[1:] != shape:
+            raise ValueError(
+                f"shared K/V is {ipc.get('shape')}, expected [L, *{shape}]"
+            )
+        if not layers:
+            return
+        device = next(iter(layers.values())).kv_cache.device
+        # Mapped on this rank's own device: reads cross NVLink/PCIe peer access,
+        # and this process makes no context on the producer's GPU.
+        shared = open_shared(ipc, load.dtype, device)
+        rank = get_tensor_model_parallel_rank()
+        world = get_tensor_model_parallel_world_size()
+        slots = self._slots(load).to(device, non_blocking=True)
+        for name, layer in layers.items():
+            heads = local_kv_heads(num_kv_heads, layer.num_kv_heads, rank, world)
+            kv = shared[
+                extract_layer_index(name),
+                :,
+                heads.start : heads.stop,
+                load.start : load.end,
+            ].to(self._dtype)
+            key, value = kv.transpose(1, 2)
+            layer.impl.do_kv_cache_update(
+                layer, key.contiguous(), value.contiguous(), layer.kv_cache, slots
+            )
+        # The producer may free the memory once the lease is gone.
+        torch.accelerator.synchronize(device)
+
+    def _slots(self, load: DocumentLoad) -> torch.Tensor:
+        positions = torch.arange(load.start, load.end, dtype=torch.int64)
+        blocks = torch.tensor(load.block_ids, dtype=torch.int64)
+        slots = blocks[positions // self._block_size] * self._block_size
+        return slots + positions % self._block_size
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         failed, self._failed_block_ids = self._failed_block_ids, set()

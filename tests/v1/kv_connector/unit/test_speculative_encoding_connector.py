@@ -5,6 +5,10 @@ document from the store, what a failed load reports, and the store and reader
 helpers."""
 
 import json
+import os
+import threading
+import time
+import weakref
 
 import pytest
 import torch
@@ -23,6 +27,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding.connector
 from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding.reader import (  # noqa: E501
     local_kv_heads,
     split_ranges,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding.shared import (  # noqa: E501
+    SharedDocument,
+    published_meta,
 )
 from vllm.forward_context import ForwardContext
 from vllm.utils.hashing import sha256
@@ -373,3 +381,28 @@ def test_local_kv_heads(num_kv_heads, world, expected):
     assert [local_kv_heads(num_kv_heads, local, r, world) for r in range(world)] == (
         expected
     )
+
+
+def test_closing_a_shared_document_waits_for_its_readers(tmp_path):
+    """A shared document's GPU memory outlives every worker still reading it,
+    and no worker starts reading once `close()` began."""
+    folder = tmp_path / "doc"
+    folder.mkdir()
+    (folder / "meta.json").write_text("{}")
+    kv = torch.zeros(1)
+    freed = threading.Event()
+    weakref.finalize(kv, freed.set)
+    document = SharedDocument(folder, kv, os.open(folder / "meta.json", os.O_RDONLY))
+    del kv
+    with published_meta(folder):
+        closer = threading.Thread(target=document.close)
+        closer.start()
+        deadline = time.monotonic() + 5
+        while folder.exists() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert not folder.exists()
+        with pytest.raises(FileNotFoundError), published_meta(folder):
+            pass
+        assert not freed.wait(0.1)
+    closer.join(5)
+    assert freed.is_set()

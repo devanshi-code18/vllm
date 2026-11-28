@@ -10,6 +10,9 @@ or, with the layer-inputs payload (the served model writes its own K/V):
     <store>/<key>/meta.json                  format, prompt_token_ids, geometry
     <store>/<key>/layer_inputs.safetensors   "layers.<i>": [N, hidden_size]
 
+or, for a document shared from a producer's GPU (`shared.share_document`),
+meta.json with the CUDA IPC handle of its K/V and no file.
+
 `write_document` writes into a temporary directory and renames it into place,
 so readers never see a partial document. Published documents are immutable.
 """
@@ -52,6 +55,8 @@ class StoredDocument:
     provenance: str
     format: str = FORMAT
     hidden_size: int = 0
+    # Boot id of the host whose GPU holds the K/V (shared documents only).
+    shared_host: str = ""
 
     @property
     def num_tokens(self) -> int:
@@ -92,21 +97,34 @@ def write_document(
         FileExistsError: `key` is already published.
 
     """
-    if not _KEY.fullmatch(key):
-        raise ValueError(f"invalid document key {key!r}")
     layers = list(kv.unbind(0)) if isinstance(kv, torch.Tensor) else list(kv)
-    num_tokens = len(prompt_token_ids)
-    _, tokens, heads, head_size = layers[0].shape
-    if tokens != num_tokens:
-        raise ValueError(f"KV holds {tokens} tokens, prompt_token_ids {num_tokens}")
-    dtype = str(layers[0].dtype).removeprefix("torch.")
-    if dtype not in DTYPES:
-        raise ValueError(f"KV dtype {dtype} is not one of {list(DTYPES)}")
+    meta = check_document(key, prompt_token_ids, layers, provenance)
     tensors = {
         f"layers.{i}": layer.permute(0, 2, 1, 3).contiguous().cpu()
         for i, layer in enumerate(layers)
     }
-    meta = {
+    return _publish(Path(store), key, tensors, meta)
+
+
+def check_document(
+    key: str,
+    prompt_token_ids: Sequence[int],
+    layers: list[torch.Tensor],
+    provenance: str,
+) -> dict:
+    """The meta.json of a document to publish, after checking its K/V."""
+    if not _KEY.fullmatch(key):
+        raise ValueError(f"invalid document key {key!r}")
+    num_tokens = len(prompt_token_ids)
+    _, tokens, heads, head_size = layers[0].shape
+    if tokens != num_tokens:
+        raise ValueError(f"KV holds {tokens} tokens, prompt_token_ids {num_tokens}")
+    if any(layer.shape != layers[0].shape for layer in layers):
+        raise ValueError("every layer's KV must have the same shape")
+    dtype = str(layers[0].dtype).removeprefix("torch.")
+    if dtype not in DTYPES:
+        raise ValueError(f"KV dtype {dtype} is not one of {list(DTYPES)}")
+    return {
         "format": FORMAT,
         "prompt_token_ids": [int(t) for t in prompt_token_ids],
         "num_layers": len(layers),
@@ -115,7 +133,6 @@ def write_document(
         "dtype": dtype,
         "provenance": provenance,
     }
-    return _publish(Path(store), key, tensors, meta)
 
 
 def write_document_layer_inputs(
@@ -206,7 +223,9 @@ def read_document(store: Path, key: str) -> StoredDocument:
     file = PAYLOAD_FILES.get(meta.get("format"))
     if file is None:
         raise ValueError(f"unknown format {meta.get('format')!r}")
-    if not (folder / file).is_file():
+    ipc = meta.get("ipc")
+    shared = isinstance(ipc, dict)
+    if not shared and not (folder / file).is_file():
         raise FileNotFoundError(folder / file)
     try:
         layer_inputs = meta["format"] == LAYER_INPUTS_FORMAT
@@ -220,6 +239,7 @@ def read_document(store: Path, key: str) -> StoredDocument:
             provenance=str(meta.get("provenance", "")),
             format=meta["format"],
             hidden_size=int(meta["hidden_size"]) if layer_inputs else 0,
+            shared_host=str(ipc.get("host", "")) if shared else "",
         )
     except (KeyError, TypeError) as e:
         raise ValueError(f"{folder / 'meta.json'}: missing or invalid {e}") from e
