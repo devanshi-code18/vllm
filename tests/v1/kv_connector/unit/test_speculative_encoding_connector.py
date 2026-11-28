@@ -4,7 +4,13 @@
 document from the store, what a failed load reports, and the store and reader
 helpers."""
 
+import gc
 import json
+import os
+import shutil
+import threading
+import time
+import weakref
 
 import pytest
 import torch
@@ -22,6 +28,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding.connector
 from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding.reader import (  # noqa: E501
     local_kv_heads,
     split_ranges,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding.shared import (  # noqa: E501
+    SharedDocument,
+    host_id,
+    pid_namespace,
+    published_meta,
 )
 from vllm.forward_context import ForwardContext
 from vllm.utils.hashing import sha256
@@ -130,13 +142,20 @@ def _write_meta(store, key, text):
         "empty_meta",
         "missing_field",
         "other_model",
+        "shared_not_enabled",
+        "shared_from_other_host",
+        "shared_by_exited_process",
+        "shared_by_this_process",
     ],
 )
 def test_prefills_when_document_does_not_apply(tmp_path, case):
     """Every client-chosen key or broken store entry prefills; none fails the
     engine."""
     _publish(tmp_path)
-    scheduler = create_scheduler(_config(tmp_path))
+    extra = {"shared_documents": True} if case.startswith("shared_") else {}
+    if case == "shared_not_enabled":
+        extra = {}
+    scheduler = create_scheduler(_config(tmp_path, **extra))
     # A first request (own salt: no prefix hits) caches the document's metadata.
     _schedule_one(
         scheduler, _request(DOCUMENT + [1], cache_salt="first", request_id="first")
@@ -173,6 +192,25 @@ def test_prefills_when_document_does_not_apply(tmp_path, case):
     elif case == "other_model":
         _publish(tmp_path, key="doc1", heads=HEADS // 2)
         kwargs["document"] = "doc1"
+    elif case.startswith("shared"):
+        meta = json.loads((tmp_path / "doc0" / "meta.json").read_text())
+        meta["ipc"] = {"host": "another-host"}
+        # This host (on Linux; elsewhere the host check refuses it first).
+        if case == "shared_by_exited_process":
+            meta["ipc"] = {
+                "host": host_id(),
+                "pid": 2**22 + 1,
+                "pid_namespace": pid_namespace(),
+                "start_time": 1,
+            }
+        elif case == "shared_by_this_process":
+            meta["ipc"] = {
+                "host": host_id(),
+                "pid": os.getpid(),
+                "pid_namespace": pid_namespace(),
+            }
+        _write_meta(tmp_path, "doc1", json.dumps(meta))
+        kwargs["document"] = "doc1"
     _, scheduled, loads = _schedule_one(scheduler, _request(prompt, **kwargs))
     assert loads == []
     assert scheduled == len(prompt)
@@ -190,6 +228,10 @@ def _corrupt(store, case):
     if case == "deleted":
         kv.unlink()  # gone before the worker reads
         return
+    if case == "republished":  # same tokens and shape, published again
+        shutil.rmtree(store / "doc0")
+        _publish(store)
+        return
     # A file that disagrees with meta.json: other tokens, heads or dtype.
     tokens, heads, dtype = len(DOCUMENT), HEADS, torch.bfloat16
     if case == "other_tokens":
@@ -204,7 +246,7 @@ def _corrupt(store, case):
 
 
 @pytest.mark.parametrize(
-    "case", ["deleted", "other_tokens", "other_heads", "other_dtype"]
+    "case", ["deleted", "republished", "other_tokens", "other_heads", "other_dtype"]
 )
 def test_failed_load_spares_shared_prefix_blocks(tmp_path, case):
     """A request whose load fails reports only the blocks the load writes, so
@@ -378,3 +420,46 @@ def test_local_kv_heads(num_kv_heads, world, expected):
     assert [local_kv_heads(num_kv_heads, local, r, world) for r in range(world)] == (
         expected
     )
+
+
+def test_closing_a_shared_document_waits_for_its_readers(tmp_path):
+    """A shared document's GPU memory outlives every worker still reading it,
+    and no worker starts reading once `close()` began."""
+    folder = tmp_path / "doc"
+    folder.mkdir()
+    (folder / "meta.json").write_text("{}")
+    kv = torch.zeros(1)
+    freed = threading.Event()
+    weakref.finalize(kv, freed.set)
+    document = SharedDocument(folder, kv, os.open(folder / "meta.json", os.O_RDONLY))
+    del kv
+    with published_meta(folder):
+        closer = threading.Thread(target=document.close)
+        closer.start()
+        deadline = time.monotonic() + 5
+        while folder.exists() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert not folder.exists()
+        with pytest.raises(FileNotFoundError), published_meta(folder):
+            pass
+        assert not freed.wait(0.1)
+    closer.join(5)
+    assert freed.is_set()
+
+
+def test_dropping_a_shared_document_unpublishes_it_and_keeps_its_memory(
+    tmp_path,
+):
+    """Without `close()`, nothing knows when readers are done: the document is
+    unpublished at once and its memory is never handed back for reuse."""
+    folder = tmp_path / "doc"
+    folder.mkdir()
+    (folder / "meta.json").write_text("{}")
+    kv = torch.zeros(1)
+    freed = threading.Event()
+    weakref.finalize(kv, freed.set)
+    document = SharedDocument(folder, kv, os.open(folder / "meta.json", os.O_RDONLY))
+    del kv, document
+    gc.collect()
+    assert not folder.exists()
+    assert not freed.is_set()
