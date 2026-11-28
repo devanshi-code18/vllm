@@ -59,13 +59,15 @@ The scheduler loads the document only when the request's prompt starts with the 
 
 One directory per document:
 
-- `<store>/<key>/meta.json`: `format` (`speculative-encoding-kv/1`), `prompt_token_ids` (the `N` tokens the KV covers), `num_layers`, `num_kv_heads`, `head_size`, `dtype`, `provenance`.
-- `<store>/<key>/kv.safetensors`: per layer, `layers.<i>` of shape `[2, num_kv_heads, N, head_size]`: post-RoPE K and V of all heads.
+- `<store>/<key>/meta.json`: `format` (`speculative-encoding-kv/1`), `prompt_token_ids` (the `N` tokens the KV covers), `num_layers`, `num_kv_heads`, `head_size`, `dtype`, `provenance`; for hybrid models also `kv_layers` (the attention layers stored), `kv_first` (per sliding window layer, the first token it holds, if not 0) and `state_layers` (the gated delta net layers).
+- `<store>/<key>/kv.safetensors`: per attention layer, `layers.<i>` of shape `[2, num_kv_heads, n, head_size]`: post-RoPE K and V of all heads for tokens `kv_first[i]..N-1`. Per gated delta net layer, its state after all `N` tokens: `conv_q.<i>`, `conv_k.<i>` `[num_k_heads, head_k_dim, kernel - 1]`, `conv_v.<i>` `[num_v_heads, head_v_dim, kernel - 1]` (the causal convolution's last inputs) and `recurrent.<i>` `[num_v_heads, head_v_dim, head_k_dim]`. `gdn_state_from_hf` converts one sequence's state from a transformers cache layer.
 
 `write_document` writes a document to a temporary directory and renames it into place, so readers never see a partial one, and refuses a key that is already published. Treat published documents as immutable: publish a changed translation under a new key. Keys may contain only letters, digits, `_`, `.` and `-`.
 
 ## Limitations
 
-- Models with a single KV cache group only: full-attention models, or models whose sliding-window layers run with the hybrid KV cache manager disabled (the default with this connector). MLA, Mamba and gated-delta layers are not supported.
+- Attention (full or sliding window) and gated delta net layers only; MLA and other Mamba layers are not supported. Hybrid models (for example Gemma 3 with the hybrid KV cache manager, Qwen3.5) need `load_async`.
+- A document with gated delta net state loads only for prompts longer than the document: the state is stored after its last token. Such models run without speculative decoding.
+- A request prefills when a sliding window layer's stored tokens start after the window of the first token it computes.
 - No speculative decoding with a draft model (EAGLE, MTP, `draft_model` and the like): the store holds only the served model's K/V. `ngram` and `suffix` work.
 - If a document's file disappears between scheduling and loading, `kv_load_failure_policy` applies to that request (with `load_async: false`, to the blocks the load would have written). With `load_async: false`, async scheduling and `recompute`, the request whose load failed never finishes and its blocks stay held ([#45138](https://github.com/vllm-project/vllm/issues/45138)): keep `load_async` on or the default policy `fail`.

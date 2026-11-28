@@ -27,6 +27,7 @@ from speculative_encoding import encode as E
 from speculative_encoding.api import SpeculativeEncoder
 
 from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding import (
+    gdn_state_from_hf,
     write_document,
 )
 
@@ -52,18 +53,36 @@ def main():
     encoder = SpeculativeEncoder.from_pretrained(
         found.checkpoint, source=args.source, target=args.target
     )
-    if encoder.hybrid:
-        raise SystemExit(f"{args.target} is not a full-attention model")
     encoded = encoder.encode(text).full
     key = document_key(text)
     fingerprint = E.translator_fingerprint(encoder.translator, args.source)
-    write_document(
-        args.store,
-        key,
-        encoded.prefix_ids,
-        encoded.prefix,
-        provenance=f"{args.source}->{args.target}:{fingerprint}",
-    )
+    provenance = f"{args.source}->{args.target}:{fingerprint}"
+    prefix = encoded.prefix
+    if isinstance(prefix, dict):
+        # A hybrid target: K/V of the attention layers (sliding window layers
+        # keep only their window) and gated delta net state, in transformers'
+        # cache layouts.
+        config = encoder.target.config
+        states = {
+            i: gdn_state_from_hf(
+                prefix["conv"][i],
+                prefix["ssm"][i],
+                config.linear_num_key_heads,
+                config.linear_key_head_dim,
+            )
+            for i in prefix["conv"]
+        }
+        write_document(
+            args.store,
+            key,
+            encoded.prefix_ids,
+            prefix["kv"],
+            provenance,
+            kv_first=prefix["kv_first"],
+            states=states,
+        )
+    else:
+        write_document(args.store, key, encoded.prefix_ids, prefix, provenance)
     print(json.dumps({"document": key, "num_tokens": len(encoded.prefix_ids)}))
 
 

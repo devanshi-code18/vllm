@@ -16,6 +16,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding import (
     write_document,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding.connector import (  # noqa: E501
+    NULL_BLOCK_ID,
     SpeculativeEncodingConnector,
     SpeculativeEncodingConnectorMetadata,
 )
@@ -26,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding.reader im
 from vllm.forward_context import ForwardContext
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.request import Request, RequestStatus
 
@@ -92,7 +94,7 @@ def test_document_tokens_load_from_store(tmp_path):
     _publish(tmp_path)
     question = [7, 8, 9, 10]
     _, scheduled, loads = _schedule_one(
-        create_scheduler(_config(tmp_path)), _request(DOCUMENT + question)
+        _scheduler(_config(tmp_path)), _request(DOCUMENT + question)
     )
     assert [(load.key, load.start, load.end) for load in loads] == [
         ("doc0", 0, len(DOCUMENT))
@@ -105,7 +107,7 @@ def test_last_prompt_token_is_computed(tmp_path):
     # whose logits sample the first output token.
     _publish(tmp_path)
     _, scheduled, loads = _schedule_one(
-        create_scheduler(_config(tmp_path)), _request(DOCUMENT)
+        _scheduler(_config(tmp_path)), _request(DOCUMENT)
     )
     assert [(load.start, load.end) for load in loads] == [(0, len(DOCUMENT) - 1)]
     assert scheduled == 1
@@ -136,7 +138,7 @@ def test_prefills_when_document_does_not_apply(tmp_path, case):
     """Every client-chosen key or broken store entry prefills; none fails the
     engine."""
     _publish(tmp_path)
-    scheduler = create_scheduler(_config(tmp_path))
+    scheduler = _scheduler(_config(tmp_path))
     # A first request (own salt: no prefix hits) caches the document's metadata.
     _schedule_one(
         scheduler, _request(DOCUMENT + [1], cache_salt="first", request_id="first")
@@ -180,7 +182,7 @@ def test_prefills_when_document_does_not_apply(tmp_path, case):
 
 def test_cache_salt_can_be_optional(tmp_path):
     _publish(tmp_path)
-    scheduler = create_scheduler(_config(tmp_path, require_cache_salt=False))
+    scheduler = _scheduler(_config(tmp_path, require_cache_salt=False))
     _, _, loads = _schedule_one(scheduler, _request(DOCUMENT + [7], cache_salt=None))
     assert len(loads) == 1
 
@@ -211,7 +213,7 @@ def test_failed_load_spares_shared_prefix_blocks(tmp_path, case):
     a running request sharing its prefix-cache hits keeps running."""
     _publish(tmp_path)
     config = _config(tmp_path)
-    scheduler = create_scheduler(config)
+    scheduler = _scheduler(config)
     shared = _request(DOCUMENT[:48] + [1, 2, 3], document=None, request_id="shared")
     output, _, _ = _schedule_one(scheduler, shared)
     scheduler.update_from_output(output, create_model_runner_output([shared]))
@@ -228,7 +230,7 @@ def test_failed_load_spares_shared_prefix_blocks(tmp_path, case):
         ForwardContext(no_compile_layers={}, attn_metadata={}, slot_mapping={})
     )
     failed = worker.get_block_ids_with_load_errors()
-    assert failed == {load.block_ids[3]}
+    assert failed == {load.block_ids[0][3]}
 
     scheduler.update_from_output(
         output,
@@ -238,20 +240,26 @@ def test_failed_load_spares_shared_prefix_blocks(tmp_path, case):
     assert loading.status == RequestStatus.FINISHED_ERROR
 
 
-def _kv_cache_config(num_groups=1):
+def _kv_cache_config(num_groups=1, num_blocks=10000):
+    """The test model's attention layers, in `num_groups` KV cache groups."""
     spec = AttentionSpec(
         block_size=BLOCK_SIZE,
         num_kv_heads=HEADS,
         head_size=HEAD_SIZE,
         dtype=torch.float16,
     )
+    names = [f"model.layers.{i}.self_attn.attn" for i in range(LAYERS)]
     return KVCacheConfig(
-        num_blocks=16,
+        num_blocks=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
-            make_kv_cache_group([f"layer.{i}"], spec) for i in range(num_groups)
+            make_kv_cache_group(names[g::num_groups], spec) for g in range(num_groups)
         ],
     )
+
+
+def _scheduler(config):
+    return create_scheduler(config, kv_cache_config=_kv_cache_config())
 
 
 def _worker(config, kv_cache_config):
@@ -273,7 +281,7 @@ def test_document_loads_in_background(tmp_path, delete):
     failed load fails that request only."""
     _publish(tmp_path)
     config = _config(tmp_path, load_async=True)
-    scheduler = create_scheduler(config)
+    scheduler = _scheduler(config)
     running = _request([1, 2, 3], document=None, request_id="running")
     output, _, _ = _schedule_one(scheduler, running)
     scheduler.update_from_output(output, create_model_runner_output([running]))
@@ -316,11 +324,105 @@ def test_document_loads_in_background(tmp_path, delete):
         assert output.num_scheduled_tokens["loading"] == 2
 
 
-def test_refuses_several_kv_cache_groups(tmp_path):
-    with pytest.raises(ValueError, match="single KV cache group"):
+def test_several_kv_cache_groups_need_background_loads(tmp_path):
+    # A failed step load is reported by block id, which can't name a group.
+    with pytest.raises(ValueError, match="needs load_async"):
         SpeculativeEncodingConnector(
             _config(tmp_path), KVConnectorRole.SCHEDULER, _kv_cache_config(2)
         )
+    SpeculativeEncodingConnector(
+        _config(tmp_path, load_async=True),
+        KVConnectorRole.SCHEDULER,
+        _kv_cache_config(2),
+    )
+
+
+def _sliding_window_kv_cache_config(window=BLOCK_SIZE):
+    # Layers 0..5 full attention, 6..11 a sliding window.
+    names = [f"model.layers.{i}.self_attn.attn" for i in range(LAYERS)]
+    spec = AttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=HEADS,
+        head_size=HEAD_SIZE,
+        dtype=torch.float16,
+    )
+    return KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            make_kv_cache_group(names[:6], spec),
+            make_kv_cache_group(
+                names[6:],
+                spec,
+                SlidingWindowManager,
+                SlidingWindowManager.config(sliding_window=window),
+            ),
+        ],
+    )
+
+
+def test_sliding_window_group_loads_its_window(tmp_path):
+    """With the hybrid KV cache manager, a load covers every group: a sliding
+    window group's blocks before the window stay null and are not loaded."""
+    _publish(tmp_path)
+    kv_cache_config = _sliding_window_kv_cache_config()
+    config = _config(tmp_path, load_async=True)
+    scheduler = create_scheduler(config, kv_cache_config=kv_cache_config)
+    scheduler.add_request(_request(DOCUMENT + [7, 8], request_id="loading"))
+    meta = scheduler.schedule().kv_connector_metadata
+    assert isinstance(meta, SpeculativeEncodingConnectorMetadata)
+    (load,) = meta.loads
+    full, window = load.block_ids
+    assert NULL_BLOCK_ID not in full
+    # Tokens 0..49: the window group holds only the blocks of its last tokens.
+    assert window[0] == NULL_BLOCK_ID and window[-1] != NULL_BLOCK_ID
+    # vLLM zeroes the blocks first; the load writes after that.
+    assert (
+        SpeculativeEncodingConnector(
+            config, KVConnectorRole.SCHEDULER, kv_cache_config
+        ).get_loaded_kv_cache_group_ids(scheduler.requests["loading"])
+        == ()
+    )
+
+
+def test_sliding_window_layer_must_hold_the_first_computed_tokens_window(tmp_path):
+    """A document whose sliding window layers keep only the last window: a
+    prompt that is the document loads one token short, so its first computed
+    token attends to a token those layers don't hold, and it prefills."""
+    first = len(DOCUMENT) - BLOCK_SIZE + 1
+    kv = {
+        i: torch.zeros(
+            2,
+            len(DOCUMENT) - (first if i >= 6 else 0),
+            HEADS,
+            HEAD_SIZE,
+            dtype=torch.bfloat16,
+        )
+        for i in range(LAYERS)
+    }
+    write_document(
+        tmp_path, "doc0", DOCUMENT, kv, kv_first={i: first for i in range(6, LAYERS)}
+    )
+    connector = SpeculativeEncodingConnector(
+        _config(tmp_path, load_async=True),
+        KVConnectorRole.SCHEDULER,
+        _sliding_window_kv_cache_config(),
+    )
+    assert connector.get_num_new_matched_tokens(_request(DOCUMENT), 0) == (0, False)
+    assert connector.get_num_new_matched_tokens(_request(DOCUMENT + [7]), 0) == (
+        len(DOCUMENT),
+        True,
+    )
+    # A served window wider than the stored one.
+    connector = SpeculativeEncodingConnector(
+        _config(tmp_path, load_async=True),
+        KVConnectorRole.SCHEDULER,
+        _sliding_window_kv_cache_config(window=2 * BLOCK_SIZE),
+    )
+    assert connector.get_num_new_matched_tokens(_request(DOCUMENT + [7]), 0) == (
+        0,
+        False,
+    )
 
 
 def test_refuses_draft_model_speculation(tmp_path):
