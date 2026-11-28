@@ -46,6 +46,7 @@ class StateLoadConnector(KVConnectorBase_V1, SupportsHMA):
         self.pending: dict[str, tuple] = {}
         self.group_of: dict[str, int] = {}
         self.block_sizes = [g.block_size for g in kv_cache_config.kv_cache_groups]
+        self.num_blocks = kv_cache_config.num_blocks
         self.mamba_layers: set[str] = set()
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
             for name, spec in group.kv_cache_specs.items():
@@ -85,14 +86,25 @@ class StateLoadConnector(KVConnectorBase_V1, SupportsHMA):
         return False, None
 
     def register_kv_caches(self, kv_caches):
-        # Attention: [blocks, heads, block_size, K|V]. Mamba: [blocks, 1, 1, page].
+        # Attention: [kernel blocks, heads, kernel block size, K|V]; a backend
+        # may split each block into smaller kernel blocks (e.g. on Blackwell).
+        # Mamba: [blocks, 1, 1, page].
         self.kv_caches = kv_caches
 
     def _slots(self, name, block_ids, num_tokens):
         block_size = self.block_sizes[self.group_of[name]]
+        kernel_block_size = self.kv_caches[name].shape[2]
+        # Unpacked layout: each block's kernel blocks are adjacent.
+        assert self.kv_caches[name].shape[0] == self.num_blocks * (
+            block_size // kernel_block_size
+        )
         positions = torch.arange(num_tokens)
         blocks = torch.tensor(block_ids[self.group_of[name]])[positions // block_size]
-        return blocks, positions % block_size
+        kernel_blocks = (
+            blocks * (block_size // kernel_block_size)
+            + positions % block_size // kernel_block_size
+        )
+        return kernel_blocks, positions % kernel_block_size
 
     def _state_block(self, name, block_ids, num_tokens):
         column = (num_tokens - 1) // self.block_sizes[self.group_of[name]]
