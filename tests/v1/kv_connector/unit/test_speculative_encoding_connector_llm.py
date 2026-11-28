@@ -3,6 +3,9 @@
 """Through `LLM`: a request that names a document in the store reads that
 document's KV from the store instead of prefilling it, with any TP size."""
 
+import json
+
+import pybase64 as base64
 import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -12,6 +15,7 @@ from tests.utils import create_new_process_for_each_test, multi_gpu_marks
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.speculative_encoding import (
+    share_document,
     write_document,
 )
 from vllm.inputs import TokensPrompt
@@ -50,21 +54,32 @@ def _document_kv(ids: list[int]) -> torch.Tensor:
 @pytest.mark.skipif(current_platform.is_rocm(), reason="not validated on ROCm")
 @create_new_process_for_each_test("spawn")
 @pytest.mark.parametrize(
-    "tp, kv_cache_dtype",
+    "tp, kv_cache_dtype, shared",
     [
-        (1, "auto"),
-        (1, "fp8"),
-        pytest.param(2, "auto", marks=multi_gpu_marks(num_gpus=2)),
+        (1, "auto", False),
+        (1, "fp8", False),
+        pytest.param(2, "auto", False, marks=multi_gpu_marks(num_gpus=2)),
+        (1, "auto", True),
+        pytest.param(2, "auto", True, marks=multi_gpu_marks(num_gpus=2)),
     ],
 )
-def test_requests_read_document_kv_from_store(tmp_path, tp, kv_cache_dtype):
+def test_requests_read_document_kv_from_store(tmp_path, tp, kv_cache_dtype, shared):
+    """`shared`: the K/V stays on this process's GPU (CUDA IPC) instead of a
+    file; every worker maps it on its own device."""
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     document = tokenizer(DOCUMENT)["input_ids"]
     prompts = [document + tokenizer(q)["input_ids"] for q in QUESTIONS]
     kv = _document_kv(document)
-    write_document(tmp_path, "lease", document, kv)
     # Same tokens, wrong KV: answers change only if requests read the store.
-    write_document(tmp_path, "zeros", document, torch.zeros_like(kv))
+    documents = {"lease": kv, "zeros": torch.zeros_like(kv)}
+    published = []
+    for key, document_kv in documents.items():
+        if shared:
+            published.append(
+                share_document(tmp_path, key, document, document_kv.to("cuda:0"))
+            )
+        else:
+            write_document(tmp_path, key, document, document_kv)
 
     llm = LLM(
         MODEL,
@@ -75,7 +90,10 @@ def test_requests_read_document_kv_from_store(tmp_path, tp, kv_cache_dtype):
         kv_transfer_config=KVTransferConfig(
             kv_connector="SpeculativeEncodingConnector",
             kv_role="kv_both",
-            kv_connector_extra_config={"store": str(tmp_path)},
+            kv_connector_extra_config={
+                "store": str(tmp_path),
+                "shared_documents": shared,
+            },
         ),
     )
 
@@ -111,3 +129,22 @@ def test_requests_read_document_kv_from_store(tmp_path, tp, kv_cache_dtype):
         name_1="store",
     )
     assert [r[0] for r in zeros_results] != [r[0] for r in native_results]
+    if shared:
+        # A handle that does not map (forged, or its producer gone) fails the
+        # load (kv_load_failure_policy "fail"); the engine keeps serving.
+        meta_path = tmp_path / "lease" / "meta.json"
+        meta = json.loads(meta_path.read_text())
+        meta["ipc"]["handle"] = base64.b64encode(bytes(64)).decode()
+        meta_path.write_text(json.dumps(meta))
+        failed, _ = generate("lease")
+        assert [o.outputs[0].finish_reason for o in failed] == ["error"] * len(prompts)
+        _, again_results = generate(None)
+        check_logprobs_close(
+            outputs_0_lst=native_results,
+            outputs_1_lst=again_results,
+            name_0="prefill",
+            name_1="prefill after failed loads",
+        )
+    for document_ in published:
+        document_.close(timeout=5)
+        assert not document_.path.exists()

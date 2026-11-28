@@ -5,6 +5,9 @@
     <store>/<key>/meta.json        format, prompt_token_ids, KV geometry
     <store>/<key>/kv.safetensors   "layers.<i>": [2, num_kv_heads, N, head_size]
 
+or, for a document shared from a producer's GPU (`shared.share_document`),
+meta.json with the CUDA IPC handle of its K/V and no file.
+
 `write_document` writes into a temporary directory and renames it into place,
 so readers never see a partial document. Published documents are immutable.
 """
@@ -40,6 +43,8 @@ class StoredDocument:
     head_size: int
     dtype: torch.dtype
     provenance: str
+    # Boot id of the host whose GPU holds the K/V (shared documents only).
+    shared_host: str = ""
 
     @property
     def num_tokens(self) -> int:
@@ -72,16 +77,8 @@ def write_document(
         FileExistsError: `key` is already published.
 
     """
-    if not _KEY.fullmatch(key):
-        raise ValueError(f"invalid document key {key!r}")
     layers = list(kv.unbind(0)) if isinstance(kv, torch.Tensor) else list(kv)
-    num_tokens = len(prompt_token_ids)
-    _, tokens, heads, head_size = layers[0].shape
-    if tokens != num_tokens:
-        raise ValueError(f"KV holds {tokens} tokens, prompt_token_ids {num_tokens}")
-    dtype = str(layers[0].dtype).removeprefix("torch.")
-    if dtype not in DTYPES:
-        raise ValueError(f"KV dtype {dtype} is not one of {list(DTYPES)}")
+    meta = check_document(key, prompt_token_ids, layers, provenance)
     store = Path(store)
     store.mkdir(parents=True, exist_ok=True)
     final = store / key
@@ -96,15 +93,6 @@ def write_document(
             for i, layer in enumerate(layers)
         }
         save_file(tensors, tmp / "kv.safetensors")
-        meta = {
-            "format": FORMAT,
-            "prompt_token_ids": [int(t) for t in prompt_token_ids],
-            "num_layers": len(layers),
-            "num_kv_heads": heads,
-            "head_size": head_size,
-            "dtype": dtype,
-            "provenance": provenance,
-        }
         (tmp / "meta.json").write_text(json.dumps(meta))
         # Fails, rather than replaces, if another writer published `key` first.
         os.rename(tmp, final)
@@ -112,6 +100,35 @@ def write_document(
         shutil.rmtree(tmp, ignore_errors=True)
         raise
     return final
+
+
+def check_document(
+    key: str,
+    prompt_token_ids: Sequence[int],
+    layers: list[torch.Tensor],
+    provenance: str,
+) -> dict:
+    """The meta.json of a document to publish, after checking its K/V."""
+    if not _KEY.fullmatch(key):
+        raise ValueError(f"invalid document key {key!r}")
+    num_tokens = len(prompt_token_ids)
+    _, tokens, heads, head_size = layers[0].shape
+    if tokens != num_tokens:
+        raise ValueError(f"KV holds {tokens} tokens, prompt_token_ids {num_tokens}")
+    if any(layer.shape != layers[0].shape for layer in layers):
+        raise ValueError("every layer's KV must have the same shape")
+    dtype = str(layers[0].dtype).removeprefix("torch.")
+    if dtype not in DTYPES:
+        raise ValueError(f"KV dtype {dtype} is not one of {list(DTYPES)}")
+    return {
+        "format": FORMAT,
+        "prompt_token_ids": [int(t) for t in prompt_token_ids],
+        "num_layers": len(layers),
+        "num_kv_heads": heads,
+        "head_size": head_size,
+        "dtype": dtype,
+        "provenance": provenance,
+    }
 
 
 def read_document(store: Path, key: str) -> StoredDocument:
@@ -128,7 +145,9 @@ def read_document(store: Path, key: str) -> StoredDocument:
     folder = store / key
     with open(folder / "meta.json", encoding="utf-8") as f:
         meta = json.load(f)
-    if not (folder / "kv.safetensors").is_file():
+    ipc = meta.get("ipc")
+    shared = isinstance(ipc, dict)
+    if not shared and not (folder / "kv.safetensors").is_file():
         raise FileNotFoundError(folder / "kv.safetensors")
     try:
         if meta["format"] != FORMAT:
@@ -141,6 +160,7 @@ def read_document(store: Path, key: str) -> StoredDocument:
             head_size=int(meta["head_size"]),
             dtype=DTYPES[meta["dtype"]],
             provenance=str(meta.get("provenance", "")),
+            shared_host=str(ipc.get("host", "")) if shared else "",
         )
     except (KeyError, TypeError) as e:
         raise ValueError(f"{folder / 'meta.json'}: missing or invalid {e}") from e
